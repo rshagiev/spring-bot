@@ -1,0 +1,17 @@
+# Core Logic & Data
+pandas
+numpy
+
+# Backtesting & Visualization
+matplotlib
+
+# API & Web Services
+fastapi
+uvicorn
+
+# Testing
+pytest
+pytest-asyncio
+
+# Exchange Integration
+ccxt
