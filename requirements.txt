@@ -2,16 +2,19 @@
 pandas
 numpy
 
-# Backtesting & Visualization
-matplotlib
-
 # API & Web Services
 fastapi
 uvicorn
+aiofiles
+
+# Exchange Integration
+ccxt==4.*
+
+# Database
+sqlite-utils==3.*
 
 # Testing
 pytest
 pytest-asyncio
-
-# Exchange Integration
-ccxt
+pytest-mock
+httpx  # <-- ДОБАВЛЕНО
