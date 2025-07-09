@@ -8,7 +8,7 @@ def mock_exchange():
     """Фикстура, создающая мок-объект для ccxt.exchange."""
     exchange = AsyncMock()
     exchange.load_markets.return_value = None
-    exchange.set_sandbox_mode.return_value = None
+    exchange.set_sandbox_mode = MagicMock(return_value=None) # <-- MODIFY THIS LINE
     exchange.fetch_balance.return_value = {
         'USDT': {'free': 1000.0, 'used': 0.0, 'total': 1000.0}
     }

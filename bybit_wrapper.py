@@ -92,3 +92,54 @@ class AsyncBybitWrapper:
             error_payload = {'symbol': symbol, 'error': str(e)}
             log_trade_execution(error_payload)
             return error_payload
+    
+    async def create_order(self, symbol: str, type: str, side: str, amount: float, price: float = None, params={}) -> dict:
+        """Универсальный метод для создания ордеров."""
+        try:
+            order = await self.exchange.create_order(symbol, type, side, amount, price, params)
+            log_trade_execution(order)
+            return order
+        except Exception as e:
+            error_payload = {'symbol': symbol, 'type': type, 'side': side, 'error': str(e)}
+            log_trade_execution(error_payload)
+            raise e
+        
+    async def create_limit_order(self, symbol: str, side: str, amount: float, price: float, params={}) -> dict:
+        """Создает лимитный ордер."""
+        try:
+            order = await self.exchange.create_limit_order(symbol, side, amount, price, params=params)
+            log_trade_execution(order)
+            return order
+        except Exception as e:
+            error_payload = {'symbol': symbol, 'side': side, 'amount': amount, 'price': price, 'error': str(e)}
+            log_trade_execution(error_payload)
+            raise  # Перебрасываем исключение, чтобы вызывающий код мог его обработать
+
+    async def edit_order(self, order_id: str, symbol: str, new_price: float) -> dict:
+        """Редактирует цену существующего ордера (обычно для SL/TP)."""
+        try:
+            order = await self.exchange.edit_order(order_id, symbol, params={'triggerPrice': new_price})
+            log_event("ORDER_EDITED", order)
+            return order
+        except Exception as e:
+            error_payload = {'order_id': order_id, 'symbol': symbol, 'new_price': new_price, 'error': str(e)}
+            log_event("ORDER_EDIT_FAILED", error_payload)
+            raise
+    
+    async def cancel_order(self, order_id: str, symbol: str) -> dict:
+        """Отменяет ордер."""
+        try:
+            response = await self.exchange.cancel_order(order_id, symbol)
+            log_event("ORDER_CANCELLED", response)
+            return response
+        except Exception as e:
+            error_payload = {'order_id': order_id, 'symbol': symbol, 'error': str(e)}
+            log_event("ORDER_CANCEL_FAILED", error_payload)
+            # Не перебрасываем исключение, т.к. ордер мог уже быть исполнен/отменен
+            return error_payload
+
+    async def fetch_my_trades(self, symbol: str, limit: int = 20) -> list:
+        """Получает историю последних сделок пользователя."""
+        if self.exchange.has['fetchMyTrades']:
+            return await self.exchange.fetch_my_trades(symbol, limit=limit)
+        return []

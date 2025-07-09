@@ -1,45 +1,80 @@
-# File: tests/test_trade_logger.py (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# file: tests/test_trade_logger.py
 import pytest
-import os
-from datetime import datetime
-import trade_logger
+import json
 
-TEST_DB = "test_log_final.sqlite"
+# Импортируем тестируемые функции
+from trade_logger import log_signal, log_trade_execution, log_event
+from db_utils import get_db_connection
 
-@pytest.fixture(autouse=True)
-def setup_teardown_db(monkeypatch):
-    monkeypatch.setattr(trade_logger, "DATABASE_FILE", TEST_DB)
-    monkeypatch.setattr(trade_logger, "_db_instance", None)
-    
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
-    yield
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
+# Эта строка применит фикстуру clean_db ко всем тестам в файле
+pytestmark = pytest.mark.usefixtures("setup_for_every_test")
 
-def test_log_signal():
-    signal_data = {
-        'pair': 'BTC/USDT:USDT',
-        'side': 'long',
-    }
-    trade_logger.log_signal(signal_data)
-    db = trade_logger.get_db()
-    log_entry = list(db["trade_log"].rows)[0]
-    assert log_entry["event_type"] == "SIGNAL_RECEIVED"
-    assert log_entry["pair"] == "BTC/USDT:USDT"
+# Добавляем фикстуру db_conn в аргументы теста
+def test_log_signal_creates_correct_record(): # REMOVE db_conn
+    """
+    Tests that log_signal correctly creates a record in the DB.
+    """
+    signal_data = {'symbol': 'BTCUSDT', 'side': 'long'}
+    log_signal(signal_data)
 
-def test_log_successful_execution():
-    order_data = {
-        'id': '123456789', 'cid': 'my_client_id_001', 'symbol': 'BTC/USDT:USDT',
-        'side': 'buy', 'amount': 0.001, 'price': 60100.0,
-        'status': 'open', 'error': None
-    }
-    trade_logger.log_trade_execution(order_data)
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = 'SIGNAL_RECEIVED'").fetchone()
+    finally:
+        conn.close()
 
-    db = trade_logger.get_db()
-    log_entry = list(db["trade_log"].rows)[0]
+    assert log_entry is not None
+    assert log_entry['event_type'] == 'SIGNAL_RECEIVED'
+    payload = json.loads(log_entry['payload_json'])
+    assert payload['symbol'] == 'BTCUSDT'
 
-    assert log_entry["event_type"] == "ORDER_PLACED"
-    # ИЗМЕНЕНО: Проверяем ключ 'id', который приходит от CCXT и записывается в лог
-    assert log_entry["id"] == '123456789' 
-    assert log_entry["error"] is None
+
+def test_log_successful_trade_execution(): # REMOVE db_conn
+    """
+    Tests logging of a successful order placement.
+    """
+    order_data = {'id': '123', 'error': None}
+    log_trade_execution(order_data)
+
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = 'ORDER_PLACED'").fetchone()
+    finally:
+        conn.close()
+
+    assert log_entry is not None
+    assert log_entry['event_type'] == 'ORDER_PLACED'
+
+
+def test_log_failed_trade_execution(): # REMOVE db_conn
+    """
+    Tests logging of a failed order placement.
+    """
+    order_data = {'error': 'InsufficientFunds'}
+    log_trade_execution(order_data)
+
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = 'ORDER_FAILED'").fetchone()
+    finally:
+        conn.close()
+
+    assert log_entry is not None
+    assert log_entry['event_type'] == 'ORDER_FAILED'
+
+
+def test_log_event_generic(): # REMOVE db_conn
+    """Tests the generic log_event function."""
+    event_type = "CUSTOM_TEST_EVENT"
+    payload_data = {"key": "value"}
+    log_event(event_type, payload_data)
+
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = ?", (event_type,)).fetchone()
+    finally:
+        conn.close()
+
+    assert log_entry is not None
+    payload = json.loads(log_entry['payload_json'])
+    assert payload['key'] == "value"

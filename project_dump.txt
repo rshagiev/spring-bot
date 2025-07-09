@@ -1,5 +1,5 @@
 🧠 Python Project Dump for LLM — spring-bot
-📅 Date: Wed Jul  9 01:10:46 +05 2025
+📅 Date: Wed Jul  9 18:11:00 +05 2025
 📂 Path: /Users/rshagiev/PycharmProjects/spring-bot
 ==============================================
 
@@ -11,29 +11,37 @@
 ├── bybit_wrapper.py
 ├── check_keys.py
 ├── dashboard.py
+├── db_setup.py
+├── db_utils.py
 ├── dump_python_files.sh
 ├── main.py
+├── models.py
+├── position_manager.py
 ├── project_dump.txt
 ├── README.md
 ├── requirements.txt
 ├── risk_controls.py
 ├── risk_sizer.py
+├── signal_parser.py
 ├── spring_model.py
 ├── tests
 │   ├── __init__.py
 │   ├── conftest.py
-│   ├── test_api_execute.py
-│   ├── test_api_utils.py
+│   ├── test_api_process_signal.py
 │   ├── test_backtest_runner.py
 │   ├── test_bybit_wrapper.py
+│   ├── test_position_manager.py
 │   ├── test_risk_controls.py
 │   ├── test_risk_sizer.py
+│   ├── test_signal_parser.py
 │   ├── test_spring_model.py
 │   └── test_trade_logger.py
 ├── trade_logger.py
-└── trades.sqlite
+├── trades.sqlite
+├── trades.sqlite-shm
+└── trades.sqlite-wal
 
-2 directories, 24 files
+2 directories, 32 files
 
 
 📦 requirements.txt:
@@ -308,6 +316,57 @@ class AsyncBybitWrapper:
             error_payload = {'symbol': symbol, 'error': str(e)}
             log_trade_execution(error_payload)
             return error_payload
+    
+    async def create_order(self, symbol: str, type: str, side: str, amount: float, price: float = None, params={}) -> dict:
+        """Универсальный метод для создания ордеров."""
+        try:
+            order = await self.exchange.create_order(symbol, type, side, amount, price, params)
+            log_trade_execution(order)
+            return order
+        except Exception as e:
+            error_payload = {'symbol': symbol, 'type': type, 'side': side, 'error': str(e)}
+            log_trade_execution(error_payload)
+            raise e
+        
+    async def create_limit_order(self, symbol: str, side: str, amount: float, price: float, params={}) -> dict:
+        """Создает лимитный ордер."""
+        try:
+            order = await self.exchange.create_limit_order(symbol, side, amount, price, params=params)
+            log_trade_execution(order)
+            return order
+        except Exception as e:
+            error_payload = {'symbol': symbol, 'side': side, 'amount': amount, 'price': price, 'error': str(e)}
+            log_trade_execution(error_payload)
+            raise  # Перебрасываем исключение, чтобы вызывающий код мог его обработать
+
+    async def edit_order(self, order_id: str, symbol: str, new_price: float) -> dict:
+        """Редактирует цену существующего ордера (обычно для SL/TP)."""
+        try:
+            order = await self.exchange.edit_order(order_id, symbol, params={'triggerPrice': new_price})
+            log_event("ORDER_EDITED", order)
+            return order
+        except Exception as e:
+            error_payload = {'order_id': order_id, 'symbol': symbol, 'new_price': new_price, 'error': str(e)}
+            log_event("ORDER_EDIT_FAILED", error_payload)
+            raise
+    
+    async def cancel_order(self, order_id: str, symbol: str) -> dict:
+        """Отменяет ордер."""
+        try:
+            response = await self.exchange.cancel_order(order_id, symbol)
+            log_event("ORDER_CANCELLED", response)
+            return response
+        except Exception as e:
+            error_payload = {'order_id': order_id, 'symbol': symbol, 'error': str(e)}
+            log_event("ORDER_CANCEL_FAILED", error_payload)
+            # Не перебрасываем исключение, т.к. ордер мог уже быть исполнен/отменен
+            return error_payload
+
+    async def fetch_my_trades(self, symbol: str, limit: int = 20) -> list:
+        """Получает историю последних сделок пользователя."""
+        if self.exchange.has['fetchMyTrades']:
+            return await self.exchange.fetch_my_trades(symbol, limit=limit)
+        return []
 
 🔹 File: check_keys.py
 ----------------------------------------------
@@ -353,298 +412,677 @@ if __name__ == "__main__":
 
 🔹 File: dashboard.py
 ----------------------------------------------
-# File: dashboard.py (ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ)
+# file: dashboard.py
 import streamlit as st
 import pandas as pd
-import requests
-import sqlite3 # <-- Импортируем стандартный sqlite3
-import sqlite_utils
-import json
-import os
 from streamlit_autorefresh import st_autorefresh
+from db_utils import get_db_connection
+import json
 
 # --- Конфигурация ---
-API_BASE_URL = os.getenv("BOT_API_URL", "http://127.0.0.1:8000")
-DB_FILE = os.getenv("TRADE_DB", "trades.sqlite")
-REFRESH_INTERVAL_SECONDS = 5
-
-st.set_page_config(
-    page_title="Trading Bot Dashboard",
-    layout="wide",
-)
-
-# --- Автоматическое обновление страницы ---
+REFRESH_INTERVAL_SECONDS = 10
+st.set_page_config(page_title="Trading Bot Dashboard", layout="wide")
 st_autorefresh(interval=REFRESH_INTERVAL_SECONDS * 1000, key="dashboard_refresh")
 
 # --- Функции для загрузки данных ---
-@st.cache_resource
-def get_db_conn():
-    """
-    Кеширует подключение к БД.
-    ИЗМЕНЕНО: Используем sqlite3 для создания потокобезопасного подключения.
-    """
-    try:
-        # Создаем подключение с помощью стандартной библиотеки, отключая проверку потока
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        # Оборачиваем его в объект sqlite_utils
-        return sqlite_utils.Database(conn)
-    except Exception as e:
-        st.error(f"Failed to connect to database: {DB_FILE}. Error: {e}")
-        return None
-
 @st.cache_data(ttl=REFRESH_INTERVAL_SECONDS)
-def get_open_positions():
-    """Запрашивает открытые позиции с нашего API."""
-    try:
-        response = requests.get(f"{API_BASE_URL}/open_positions")
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException:
-        return {}
-
-@st.cache_data(ttl=REFRESH_INTERVAL_SECONDS)
-def get_event_log(limit=20):
-    """Читает последние события из лога."""
-    db = get_db_conn()
-    if db is None or 'trade_log' not in db.table_names():
-        return []
-    try:
-        return list(db.table('trade_log').rows_where(order_by='id DESC', limit=limit))
-    except Exception:
-        return []
+def load_data():
+    conn = get_db_connection()
+    active = pd.read_sql_query("SELECT * FROM managed_trades WHERE status != 'CLOSED' ORDER BY created_at DESC", conn)
+    history = pd.read_sql_query("SELECT * FROM managed_trades WHERE status = 'CLOSED' ORDER BY updated_at DESC LIMIT 50", conn)
+    # Используем left join для обогащения активных сделок живыми ценами
+    prices = pd.read_sql_query("SELECT * FROM live_prices", conn)
+    if not active.empty and not prices.empty:
+        active = pd.merge(active, prices, on='symbol', how='left')
+    conn.close()
+    return active, history
 
 # --- Основная структура дашборда ---
-st.title("🤖 LLM-Driven Trading Bot Dashboard")
+st.title("🤖 Stateful Trading Bot Dashboard v2.0")
+active_df, history_df = load_data()
 
-# --- Секция 1: Открытые Позиции ---
-st.subheader("📊 Open Positions")
-positions_data = get_open_positions()
-if positions_data:
-    positions_df = pd.DataFrame(list(positions_data.values()))
-    display_cols = {
-        'symbol': 'Symbol', 'side': 'Side', 'contracts': 'Size',
-        'entryPrice': 'Entry', 'markPrice': 'Mark', 'unrealizedPnl': 'uPNL'
-    }
-    existing_cols = [col for col in display_cols.keys() if col in positions_df.columns]
-    if existing_cols:
-        filtered_df = positions_df[existing_cols].rename(columns=display_cols)
-        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No open positions with required data.")
-else:
-    st.info("No open positions or API not reachable.")
+# --- Блок 1: Управляемые Сделки ---
+st.subheader("📊 Managed Trades")
+if not active_df.empty:
+    active_df['progress'] = active_df['executed_qty'] / active_df['total_qty']
+    # Добавим uPNL (упрощенно)
+    if 'mark_price' in active_df.columns:
+        active_df['uPNL'] = (active_df['mark_price'] - active_df['avg_entry_price']) * active_df['executed_qty']
+        active_df.loc[active_df['side'] == 'short', 'uPNL'] *= -1
 
-# --- Секция 2: Журнал Событий ---
-st.subheader("📜 Recent Events")
-log_data = get_event_log()
-if log_data:
-    log_df = pd.DataFrame(log_data)
-    if 'payload_json' in log_df.columns:
-        log_df['timestamp_utc'] = pd.to_datetime(log_df['timestamp_utc']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        def pretty_payload(payload_str):
-            try: return json.loads(payload_str)
-            except: return payload_str
-        log_df['payload'] = log_df['payload_json'].apply(pretty_payload)
-        st.dataframe(
-            log_df[['timestamp_utc', 'event_type', 'payload']],
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.dataframe(log_df, use_container_width=True, hide_index=True)
-else:
-    st.warning("Event log is empty or database not found.")
-
-# --- Секция 3: Кривая капитала (заглушка) ---
-st.subheader("📈 Equity Curve (placeholder)")
-st.info("Equity curve will be implemented once PnL data is logged upon trade closure.")
-
-🔹 File: main.py
-----------------------------------------------
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any
-import time
-import os
-from dotenv import load_dotenv
-
-# --- Шаг 1: Явно загружаем переменные из .env файла ---
-load_dotenv()
-MAX_ENTRY_DEVIATION_PCT = 0.005  # Максимальное отклонение цены входа в процентах (0.5%)
-
-# --- Шаг 2: Импортируем наши модули ПОСЛЕ загрузки .env ---
-from bybit_wrapper import AsyncBybitWrapper
-from risk_sizer import calculate_position_size
-from risk_controls import check_daily_drawdown, initialize_pnl_table
-from trade_logger import log_signal, log_event
-
-# --- Pydantic Models for API validation ---
-class Signal(BaseModel):
-    symbol: str
-    side: str
-    entry: float
-    sl: float
-    tp: float
-
-# --- FastAPI App Initialization ---
-API_KEY = os.getenv("BYBIT_KEY")
-API_SECRET = os.getenv("BYBIT_SECRET")
-
-if not API_KEY or not API_SECRET:
-    print("FATAL ERROR: BYBIT_KEY and/or BYBIT_SECRET not found. Please check your .env file.")
-    exit()
-
-app = FastAPI(title="LLM-Driven Trading Bot", version="0.2.0")
-bybit_client = AsyncBybitWrapper(api_key=API_KEY, secret_key=API_SECRET, testnet=True)
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initializes services when the application starts."""
-    initialize_pnl_table()
-    await bybit_client.init()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Closes the Bybit client connection when the application shuts down."""
-    await bybit_client.close()
-
-
-# --- API Endpoints ---
-@app.post("/execute")
-@check_daily_drawdown(max_loss_pct=0.03)
-async def execute_trade(signal: Signal):
-    """
-    Main endpoint for receiving and processing a trading signal.
-    Spring Model filter is DISABLED for this version.
-    """
-    log_signal(signal.model_dump())
-    
-    # Конвертируем символ для ccxt, e.g., 'BTCUSDT' -> 'BTC/USDT:USDT'
-    ccxt_symbol = f"{signal.symbol.replace('USDT', '')}/USDT:USDT"
-
-    # --- НОВЫЙ ШАГ: ПРОВЕРКА ЦЕНЫ ВХОДА ---
-    current_price = await bybit_client.fetch_ticker_price(ccxt_symbol)
-    if current_price == 0:
-        reason = {"reason": "failed_to_fetch_current_price"}
-        log_event("TRADE_REJECTED", reason)
-        raise HTTPException(status_code=503, detail=reason)
-
-    deviation = abs(current_price - signal.entry) / signal.entry
-    if deviation > MAX_ENTRY_DEVIATION_PCT:
-        reason = {
-            "reason": "price_deviation_too_high",
-            "current_price": current_price,
-            "signal_entry": signal.entry,
-            "deviation_pct": deviation * 100
-        }
-        log_event("TRADE_REJECTED", reason)
-        raise HTTPException(status_code=400, detail=reason)
-    # ------------------------------------
-
-    # Шаг 1: Получаем точность для символа
-    try:
-        precision = bybit_client.get_market_precision(ccxt_symbol)
-        if precision is None:
-            raise ValueError(f"Precision info not found for {ccxt_symbol}")
-        amount_precision_step = float(precision['amount'])
-    except Exception as e:
-        log_event("TRADE_REJECTED", {"reason": "precision_error", "details": str(e)})
-        raise HTTPException(status_code=404, detail=f"Market symbol '{ccxt_symbol}' not found or precision not available: {e}")
-
-    # Шаг 2: Расчет размера позиции
-    equity = await bybit_client.get_usdt_balance()
-    qty = calculate_position_size(
-        entry_price=signal.entry,
-        stop_loss_price=signal.sl,
-        equity=equity,
-        amount_precision_step=amount_precision_step
+    st.dataframe(
+        active_df.style.bar(subset=['progress'], align='mid', color=['#d6e8d6', '#e8d6d6']),
+        use_container_width=True, hide_index=True
     )
-    
-    if qty <= 0:
-        reason = {"reason": "risk_sizer_returned_zero_qty", "calculated_qty": qty, "equity": equity}
-        log_event("TRADE_REJECTED", reason)
-        raise HTTPException(status_code=400, detail=reason)
+else:
+    st.info("No active trades to manage.")
 
-    # Шаг 3: Установка параметров риска
-    await bybit_client.set_margin_mode(ccxt_symbol, 'isolated')
-    await bybit_client.set_leverage(ccxt_symbol, 10)
+# --- Блок 2: История Сделок ---
+st.subheader("📈 Trade History")
+if not history_df.empty:
+    st.dataframe(history_df, use_container_width=True, hide_index=True)
+else:
+    st.info("Trade history is empty.")
 
-    # Шаг 4: Исполнение ордера
-    order = await bybit_client.create_market_order_with_sl(
-        symbol=ccxt_symbol, 
-        side='buy' if signal.side == 'long' else 'sell',
-        amount=qty,
-        stop_loss_price=signal.sl
-    )
+# --- Блок 3: Журнал Событий (опционально, если нужен) ---
+# ...
 
-    if 'error' in order:
-        # Ошибка уже залогирована внутри wrapper'а
-        raise HTTPException(status_code=500, detail={"reason": "order_placement_failed", "details": order})
-
-    # Шаг 5: Успешный ответ
-    # `prob` возвращаем как -1, чтобы обозначить, что фильтр был отключен
-    return {"accepted": True, "qty": qty, "prob": -1, "order": order}
-
-# --- Utility Endpoints ---
-@app.get("/ping")
-async def ping():
-    return {"status": "ok", "timestamp": time.time()}
-
-@app.get("/open_positions", response_model=Dict[str, Any])
-async def get_open_positions():
-    try:
-        return await bybit_client.fetch_open_positions()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={'error': 'bybit-fetch_failed', 'details': str(e)})
-
-🔹 File: risk_controls.py
+🔹 File: db_setup.py
 ----------------------------------------------
+# file: db_setup.py
 import sqlite3
-import os
-from datetime import date
-from functools import wraps
-from fastapi import HTTPException
+from db_utils import get_db_connection
 
-DATABASE_FILE = os.getenv("TRADE_DB", "trades.sqlite")
-INITIAL_EQUITY = 1000.0
-
-def get_db_connection():
-    # This now uses the (potentially monkeypatched) module-level constant
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def initialize_pnl_table():
-    """Creates the daily_pnl table if it doesn't exist."""
+def setup_database():
+    """
+    Creates or updates all necessary tables and indexes in the DB.
+    This script is idempotent and safe to run multiple times.
+    """
+    print("--- Starting Database Setup ---")
     conn = get_db_connection()
-    conn.execute('''
+    cursor = conn.cursor()
+
+    try:
+        # Table 1: Managed Trades (the heart of the system)
+        print("1. Creating 'managed_trades' table...")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS managed_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instruction_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('long', 'short')),
+            status TEXT NOT NULL CHECK(status IN ('PENDING_ENTRY', 'ACTIVE', 'CLOSING', 'CLOSED')),
+            
+            entry_range_start REAL NOT NULL,
+            entry_range_end REAL NOT NULL,
+            initial_tps TEXT NOT NULL,
+            
+            avg_entry_price REAL,
+            total_qty REAL NOT NULL,
+            executed_qty REAL NOT NULL DEFAULT 0,
+            
+            initial_sl_price REAL NOT NULL,
+            current_sl_price REAL NOT NULL,
+            exchange_sl_order_id TEXT,
+            
+            -- CORRECTED COLUMN DEFINITION --
+            move_sl_to_be_after_tp_index INTEGER, 
+            
+            remaining_tps TEXT NOT NULL,
+            close_reason TEXT,
+            realized_pnl REAL,
+            
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """)
+        print("   ... 'managed_trades' table is ready.")
+
+        # Table 2: Entry Orders
+        print("2. Creating 'entry_orders' table...")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS entry_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            exchange_order_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            FOREIGN KEY (trade_id) REFERENCES managed_trades (id)
+        );
+        """)
+        print("   ... 'entry_orders' table is ready.")
+
+        # Table 3: Live Prices
+        print("3. Creating 'live_prices' table...")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS live_prices (
+            symbol TEXT PRIMARY KEY,
+            mark_price REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """)
+        print("   ... 'live_prices' table is ready.")
+
+        # Table 4: Daily PnL for Risk Controls
+        print("4. Creating 'daily_pnl' table...")
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS daily_pnl (
             trade_date DATE PRIMARY KEY,
             realised_pnl REAL NOT NULL DEFAULT 0
-        )
-    ''')
-    conn.commit()
-    conn.close()
+        );
+        """)
+        print("   ... 'daily_pnl' table is ready.")
+        
+        # Table 5: General Event Log
+        print("5. Creating 'trade_log' table...")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trade_log (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           timestamp_utc TEXT NOT NULL,
+           event_type TEXT NOT NULL,
+           -- CORRECTED COLUMN DEFINITION (NULLABLE) --
+           payload_json TEXT 
+        );
+        """)
+        print("   ... 'trade_log' table is ready.")
 
-# REMOVED: The top-level call to initialize_pnl_table() was removed.
+        # Indexes for performance
+        print("6. Creating indexes for performance...")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_managed_trades_status ON managed_trades(status);")
+        # ... other indexes ...
+        print("   ... Indexes are ready.")
+        
+        # Schema versioning
+        print("7. Setting up schema version...")
+        cursor.execute("CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        cursor.execute("INSERT OR IGNORE INTO db_meta (key, value) VALUES ('schema_version', '3');")
+        print("   ... Schema version is set.")
+
+        conn.commit()
+        print("\n--- Database setup successfully completed! ---")
+
+    except Exception as e:
+        print(f"\n--- An error occurred during database setup: {e} ---")
+        conn.rollback()
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    setup_database()
+
+🔹 File: db_utils.py
+----------------------------------------------
+# file: db_utils.py
+import sqlite3
+import json
+from datetime import datetime, timezone
+import os
+
+# Путь к БД теперь берется из env-переменной для гибкости и тестирования
+# Фикстура в conftest.py будет подменять эту переменную во время тестов.
+DATABASE_FILE = os.getenv("DATABASE_FILE", "trades.sqlite")
+
+def get_db_connection() -> sqlite3.Connection:
+    """
+    Возвращает НОВОЕ соединение с SQLite с настройками для production.
+    """
+    # timeout=30 (в секундах) автоматически установит busy_timeout
+    # check_same_thread=False важно для FastAPI, но требует аккуратного управления транзакциями.
+    conn = sqlite3.connect(DATABASE_FILE, timeout=30, check_same_thread=False)
+    # WAL-режим для безопасной конкурентной работы
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def create_managed_trade(instruction: dict, total_qty: float) -> int:
+    """
+    Создает запись о новой сделке в таблице managed_trades.
+    Эта функция сама управляет своим соединением с БД, чтобы быть потоко-безопасной.
+    """
+    conn = get_db_connection()
+    try:
+        now_utc = datetime.now(timezone.utc).isoformat(timespec='microseconds')
+        
+        # Используем `with conn:` для автоматического коммита или отката транзакции
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO managed_trades (
+                    instruction_id, symbol, side, status, entry_range_start, entry_range_end,
+                    total_qty, initial_sl_price, current_sl_price, initial_tps, remaining_tps,
+                    move_sl_to_be_after_tp_index, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    instruction.get('signal_id', 'unknown'), 
+                    instruction.get('symbol', 'BTCUSDT'), 
+                    instruction['side'], 
+                    'PENDING_ENTRY',
+                    instruction['entry_start'], 
+                    instruction['entry_end'], 
+                    total_qty,
+                    instruction['stop_loss'], 
+                    instruction['stop_loss'],
+                    json.dumps(instruction['take_profits']), 
+                    json.dumps(instruction['take_profits']),
+                    instruction.get('move_sl_to_be_after_tp_index', 1),
+                    now_utc, 
+                    now_utc
+                )
+            )
+            trade_id = cursor.lastrowid
+    finally:
+        # Гарантированно закрываем соединение
+        if conn:
+            conn.close()
+            
+    return trade_id
+
+🔹 File: main.py
+----------------------------------------------
+# file: main.py
+import asyncio
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Depends
+from dotenv import load_dotenv
+import sqlite3
+
+load_dotenv()
+
+from bybit_wrapper import AsyncBybitWrapper
+from risk_sizer import calculate_position_size
+from risk_controls import check_daily_drawdown
+from trade_logger import log_event
+from signal_parser import parse_pentagon_signal
+from db_utils import get_db_connection, create_managed_trade 
+from position_manager import position_manager_loop, place_entry_grid
+from models import TradeInstruction
+
+API_KEY = os.getenv("BYBIT_KEY")
+API_SECRET = os.getenv("BYBIT_SECRET")
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("BYBIT_KEY and BYBIT_SECRET must be set in .env file")
+
+bybit_client = AsyncBybitWrapper(api_key=API_KEY, secret_key=API_SECRET, testnet=True)
+background_tasks = set()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await bybit_client.init()
+    manager_task = asyncio.create_task(position_manager_loop(bybit_client))
+    background_tasks.add(manager_task)
+    manager_task.add_done_callback(background_tasks.discard)
+    log_event("APP_STARTUP", {"message": "Position manager started."})
+    
+    yield
+    
+    log_event("APP_SHUTDOWN", {"message": "Cancelling background tasks."})
+    for task in list(background_tasks): # Iterate over a copy
+        task.cancel()
+    await bybit_client.close()
+    log_event("APP_SHUTDOWN_COMPLETE", {"message": "Bybit client closed."})
+
+app = FastAPI(title="Stateful Trading Bot", version="1.0.0", lifespan=lifespan)
+
+def get_db():
+    db = get_db_connection()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@app.post("/process_signal", status_code=202)
+@check_daily_drawdown(max_loss_pct=0.03) 
+async def process_signal(raw_text: str, db: sqlite3.Connection = Depends(get_db)): 
+    instruction = parse_pentagon_signal(raw_text)
+    if not instruction:
+        raise HTTPException(status_code=400, detail="Signal parsing failed.")
+    
+    log_event("INSTRUCTION_PARSED", instruction.model_dump())
+
+    equity = await bybit_client.get_usdt_balance()
+    precision = bybit_client.get_market_precision(instruction.symbol)
+    if not precision or 'amount' not in precision:
+        raise HTTPException(status_code=500, detail="Could not get precision for symbol {instruction.symbol}")
+
+    risk_entry_price = instruction.entry_end if instruction.side == 'short' else instruction.entry_start
+    total_qty = calculate_position_size(
+        entry_price=risk_entry_price, stop_loss_price=instruction.stop_loss,
+        equity=equity, amount_precision_step=precision['amount'],
+        risk_pct=instruction.risk_pct
+    )
+    final_qty = total_qty * instruction.size_fraction
+    if final_qty <= 0:
+        raise HTTPException(status_code=400, detail="Calculated position size is zero.")
+
+    trade_id = create_managed_trade(instruction.model_dump(), final_qty) 
+    log_event("TRADE_CREATED_IN_DB", {"trade_id": trade_id, "qty": final_qty})
+
+    task = asyncio.create_task(
+        place_entry_grid(trade_id, final_qty, instruction.model_dump(), bybit_client)
+    )
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+    return {"status": "accepted", "trade_id": trade_id}
+
+🔹 File: models.py
+----------------------------------------------
+# file: models.py
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+class TradeInstruction(BaseModel):
+    """Структурированная инструкция, полученная из парсера."""
+    signal_id: str
+    symbol: str = "BTCUSDT"
+    side: str
+    entry_start: float
+    entry_end: float
+    stop_loss: float
+    risk_pct: float = Field(..., gt=0, le=0.1)
+    size_fraction: float = Field(default=1.0, ge=0.1, le=1.0)
+    take_profits: List[float]
+    move_sl_to_be_after_tp_index: int = 1
+
+🔹 File: position_manager.py
+----------------------------------------------
+# file: position_manager.py
+import asyncio
+import json
+import numpy as np
+import sqlite3
+from datetime import datetime, timezone
+
+from db_utils import get_db_connection
+from trade_logger import log_event
+from bybit_wrapper import AsyncBybitWrapper
+from risk_controls import update_pnl
+
+# --- Константы ---
+MANAGER_LOOP_SLEEP_INTERVAL = 15
+ENTRY_GRID_ORDERS = 3
+
+# ==============================================================================
+# 1. ЗАДАЧА РАЗМЕЩЕНИЯ ОРДЕРОВ (уже была правильной)
+# ==============================================================================
+async def place_entry_grid(trade_id: int, total_qty: float, instruction: dict, bybit_client: AsyncBybitWrapper):
+    """
+    Выставляет сетку лимитных ордеров на вход для новой сделки.
+    Эта функция корректно управляет своим собственным соединением с БД.
+    """
+    conn = get_db_connection()
+    try:
+        existing_orders = conn.execute("SELECT 1 FROM entry_orders WHERE trade_id = ?", (trade_id,)).fetchone()
+        if existing_orders:
+            log_event("GRID_PLACEMENT_SKIPPED", {"reason": "already_exists", "trade_id": trade_id})
+            return
+
+        precision = bybit_client.get_market_precision(instruction['symbol'])
+        if not precision or not precision.get('amount'):
+            log_event("GRID_PLACEMENT_ERROR", {"reason": "missing_precision", "trade_id": trade_id})
+            return
+
+        amount_step = precision.get('amount', 1e-8) # Безопасное значение по умолчанию
+        order_qty = round(total_qty / ENTRY_GRID_ORDERS, int(-np.log10(amount_step)))
+        if order_qty <= 0:
+            log_event("GRID_PLACEMENT_ERROR", {"reason": "zero_order_qty", "trade_id": trade_id})
+            return
+            
+        entry_prices = np.linspace(instruction['entry_start'], instruction['entry_end'], ENTRY_GRID_ORDERS)
+        
+        with conn:
+            for price in entry_prices:
+                try:
+                    order = await bybit_client.create_limit_order(
+                        symbol=instruction['symbol'], side=instruction['side'], amount=order_qty, price=price
+                    )
+                    log_event("ENTRY_ORDER_PLACED", {"trade_id": trade_id, "order_id": order['id'], "price": price})
+                    conn.execute(
+                        "INSERT INTO entry_orders (trade_id, exchange_order_id, status) VALUES (?, ?, ?)",
+                        (trade_id, order['id'], 'open')
+                    )
+                except Exception as e:
+                    log_event("ENTRY_ORDER_FAILED", {"trade_id": trade_id, "price": price, "error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+# ==============================================================================
+# 2. ГЛАВНЫЙ ЦИКЛ МЕНЕДЖЕРА (ИСПРАВЛЕНО)
+# ==============================================================================
+async def position_manager_loop(bybit_client: AsyncBybitWrapper):
+    """Главный цикл, который управляет всеми активными и ожидающими сделками."""
+    log_event("POSITION_MANAGER_STARTED", {})
+    while True:
+        try:
+            trades_to_manage = []
+            conn = get_db_connection()
+            try:
+                # Получаем список сделок и сразу закрываем соединение
+                trades_to_manage_rows = conn.execute("SELECT * FROM managed_trades WHERE status != 'CLOSED'").fetchall()
+                trades_to_manage = [dict(row) for row in trades_to_manage_rows]
+            finally:
+                conn.close()
+            
+            if not trades_to_manage:
+                await asyncio.sleep(MANAGER_LOOP_SLEEP_INTERVAL)
+                continue
+
+            live_positions = await bybit_client.fetch_open_positions()
+            
+            active_symbols = {trade['symbol'] for trade in trades_to_manage}
+            if active_symbols:
+                # Эта функция сама управляет своим соединением
+                await update_live_prices(bybit_client, list(active_symbols))
+            
+            for trade in trades_to_manage:
+                # Передаем bybit_client, но не соединение
+                await reconcile_and_manage(trade, live_positions.get(trade['symbol']), bybit_client)
+                
+        except asyncio.CancelledError:
+            log_event("POSITION_MANAGER_STOPPED", {})
+            break
+        except Exception as e:
+            log_event("POSITION_MANAGER_ERROR", {"error": str(e), "context": "Main Loop"})
+        
+        await asyncio.sleep(MANAGER_LOOP_SLEEP_INTERVAL)
+
+# ==============================================================================
+# 3. ЛОГИКА СВЕРКИ И УПРАВЛЕНИЯ (ИСПРАВЛЕНО)
+# ==============================================================================
+async def reconcile_and_manage(trade: dict, live_position: dict, bybit_client: AsyncBybitWrapper):
+    """
+    Центральная стейт-машина для одной сделки.
+    Больше не принимает 'conn', а создает соединения по необходимости.
+    """
+    trade_id = trade['id']
+    status = trade['status']
+    now_utc = datetime.now(timezone.utc).isoformat(timespec='microseconds')
+
+    try:
+        # --- Состояние: PENDING_ENTRY -> ACTIVE ---
+        if status == 'PENDING_ENTRY' and live_position:
+            avg_price = float(live_position['entryPrice'])
+            exec_qty = float(live_position['contracts'])
+            log_event("ENTRY_DETECTED", {"trade_id": trade_id, "avg_price": avg_price, "qty": exec_qty})
+            
+            sl_order = await bybit_client.create_order(
+                symbol=trade['symbol'], type='market', side='buy' if trade['side'] == 'short' else 'sell',
+                amount=exec_qty, params={'stopLoss': trade['initial_sl_price'], 'reduceOnly': True}
+            )
+            sl_order_id = sl_order.get('id')
+            
+            conn = get_db_connection()
+            try:
+                entry_orders_to_cancel = conn.execute("SELECT exchange_order_id FROM entry_orders WHERE trade_id = ? AND status = 'open'", (trade_id,)).fetchall()
+            finally:
+                conn.close()
+
+            for order_row in entry_orders_to_cancel:
+                await bybit_client.cancel_order(order_row['exchange_order_id'], trade['symbol'])
+
+            conn = get_db_connection()
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE managed_trades SET status=?, avg_entry_price=?, executed_qty=?, exchange_sl_order_id=?, updated_at=? WHERE id=?",
+                        ('ACTIVE', avg_price, exec_qty, sl_order_id, now_utc, trade_id)
+                    )
+                    conn.execute("UPDATE entry_orders SET status='cancelled' WHERE trade_id=? AND status='open'", (trade_id,))
+                log_event("TRADE_ACTIVATED", {"trade_id": trade_id, "sl_order_id": sl_order_id})
+            finally:
+                conn.close()
+
+        # --- Состояние: ACTIVE -> CLOSED ---
+        elif status == 'ACTIVE' and not live_position:
+            # ... (код выше без изменений) ...
+            pnl, reason = await get_realized_pnl(trade, bybit_client)
+
+            conn = get_db_connection()
+            try:
+                with conn:
+                    # ИСПРАВЛЕНИЕ: Добавляем недостающий UPDATE-запрос
+                    conn.execute(
+                        "UPDATE managed_trades SET status='CLOSED', close_reason=?, realized_pnl=?, updated_at=? WHERE id=?",
+                        (reason, pnl, now_utc, trade_id)
+                    )
+                # Убедимся, что PnL не None перед обновлением
+                if pnl is not None:
+                    update_pnl(conn, pnl) 
+            finally:
+                conn.close()
+            log_event("PNL_UPDATED", {"trade_id": trade_id, "pnl": pnl})
+
+        # --- Состояние: ACTIVE (Управление TP / SL) ---
+        elif status == 'ACTIVE' and live_position:
+            remaining_tps = json.loads(trade['remaining_tps'])
+            if not remaining_tps: return
+
+            mark_price = float(live_position['markPrice'])
+            next_tp_price = remaining_tps[0]
+
+            tp_hit = (trade['side'] == 'long' and mark_price >= next_tp_price) or \
+                     (trade['side'] == 'short' and mark_price <= next_tp_price)
+
+            if tp_hit:
+                initial_tps_count = len(json.loads(trade['initial_tps']))
+                precision = bybit_client.get_market_precision(trade['symbol'])
+                amount_step = precision.get('amount', 1e-8)
+                tp_qty = round(trade['total_qty'] / initial_tps_count, int(-np.log10(amount_step)))
+                
+                if tp_qty > 0:
+                    await bybit_client.create_limit_order(
+                        symbol=trade['symbol'], side='buy' if trade['side'] == 'short' else 'sell',
+                        amount=tp_qty, price=next_tp_price, params={'reduceOnly': True}
+                    )
+                
+                remaining_tps.pop(0)
+                conn = get_db_connection()
+                try:
+                    with conn:
+                        conn.execute("UPDATE managed_trades SET remaining_tps=?, updated_at=? WHERE id=?", (json.dumps(remaining_tps), now_utc, trade_id))
+                    log_event("TP_ORDER_PLACED", {"trade_id": trade_id, "tp_price": next_tp_price})
+                finally:
+                    conn.close()
+            
+            initial_tps_count = len(json.loads(trade['initial_tps']))
+            tps_taken = initial_tps_count - len(remaining_tps)
+            
+            if (trade.get('move_sl_to_be_after_tp_index') is not None and 
+                tps_taken >= trade['move_sl_to_be_after_tp_index'] and 
+                trade['avg_entry_price'] is not None and
+                trade['current_sl_price'] != trade['avg_entry_price']):
+                
+                new_sl_price = trade['avg_entry_price']
+                log_event("MOVING_SL_TO_BREAKEVEN", {"trade_id": trade_id, "new_sl": new_sl_price})
+                
+                await bybit_client.edit_order(
+                    trade['exchange_sl_order_id'], trade['symbol'], new_sl_price
+                )
+                conn = get_db_connection()
+                try:
+                    with conn:
+                        conn.execute("UPDATE managed_trades SET current_sl_price=?, updated_at=? WHERE id=?", (new_sl_price, now_utc, trade_id))
+                    log_event("SL_MOVE_SUCCESS", {"trade_id": trade_id})
+                finally:
+                    conn.close()
+
+    except Exception as e:
+        log_event("RECONCILE_ERROR", {"trade_id": trade_id, "error": str(e), "status": status})
+
+# ==============================================================================
+# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ИСПРАВЛЕНО)
+# ==============================================================================
+async def update_live_prices(bybit_client: AsyncBybitWrapper, symbols: list):
+    """Запрашивает и обновляет живые цены, управляя своим соединением."""
+    conn = get_db_connection()
+    try:
+        tickers = await asyncio.gather(*[bybit_client.fetch_ticker_price(s) for s in symbols])
+        now_utc = datetime.now(timezone.utc).isoformat(timespec='microseconds')
+        
+        with conn:
+            for symbol, price in zip(symbols, tickers):
+                if price > 0:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO live_prices (symbol, mark_price, updated_at) VALUES (?, ?, ?)",
+                        (symbol, price, now_utc)
+                    )
+    except Exception as e:
+        log_event("LIVE_PRICE_UPDATE_ERROR", {"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+async def get_realized_pnl(trade: dict, bybit_client: AsyncBybitWrapper) -> tuple[float, str]:
+    """
+    Получает историю сделок пользователя с биржи для расчета PnL.
+    Эта функция не взаимодействует с локальной БД.
+    """
+    try:
+        my_trades = await bybit_client.fetch_my_trades(trade['symbol'], limit=20)
+        
+        trade_open_time = datetime.fromisoformat(trade['created_at'])
+        relevant_trades = [t for t in my_trades if t.get('timestamp') and datetime.fromtimestamp(t['timestamp'] / 1000, tz=timezone.utc) > trade_open_time]
+        
+        if not relevant_trades:
+            return 0.0, "UNKNOWN_NO_TRADES"
+
+        realized_pnl = sum(t.get('fee', {}).get('cost', 0) * -1 for t in relevant_trades if t.get('fee'))
+
+        last_trade = relevant_trades[-1]
+        if last_trade.get('price') and trade.get('current_sl_price') and last_trade['price'] == trade['current_sl_price']:
+            return realized_pnl, "SL_HIT"
+        elif last_trade.get('price') and trade.get('initial_tps') and last_trade['price'] in json.loads(trade['initial_tps']):
+             return realized_pnl, "TP_HIT"
+        else:
+            return realized_pnl, "MANUAL_OR_OTHER"
+
+    except Exception as e:
+        log_event("PNL_FETCH_ERROR", {"trade_id": trade['id'], "error": str(e)})
+        return 0.0, "ERROR_FETCHING_PNL"
+
+🔹 File: risk_controls.py
+----------------------------------------------
+# file: risk_controls.py
+import sqlite3
+import os
+from datetime import date, datetime 
+from functools import wraps
+from fastapi import HTTPException
+
+# --- CHANGE 1: Import the central DB connection utility ---
+from db_utils import get_db_connection
+
+# --- CHANGE 2: Remove the local get_db_connection() and initialize_pnl_table() functions ---
+# They are no longer needed here.
+
+INITIAL_EQUITY = 1000.0
 
 def check_daily_drawdown(max_loss_pct: float = 0.03):
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
             today = date.today()
+            # This call now correctly uses the function from db_utils,
+            # which is properly patched by your tests.
             conn = get_db_connection()
             cursor = conn.cursor()
             
             current_equity = INITIAL_EQUITY
             max_loss_usd = current_equity * max_loss_pct
 
-            cursor.execute("SELECT realised_pnl FROM daily_pnl WHERE trade_date = ?", (today,))
-            result = cursor.fetchone()
-            conn.close()
-
-            realised_pnl = result['realised_pnl'] if result else 0.0
+            try:
+                cursor.execute("SELECT realised_pnl FROM daily_pnl WHERE trade_date = ?", (today,))
+                result = cursor.fetchone()
+                realised_pnl = result['realised_pnl'] if result else 0.0
+            except sqlite3.OperationalError as e:
+                # Handle case where table might not exist in a faulty setup, but log it.
+                print(f"Database error in check_daily_drawdown: {e}")
+                realised_pnl = 0.0
+            finally:
+                conn.close()
 
             if realised_pnl <= -max_loss_usd:
                 raise HTTPException(
@@ -656,18 +1094,26 @@ def check_daily_drawdown(max_loss_pct: float = 0.03):
         return wrapper
     return decorator
 
-def update_pnl(pnl: float):
-    """Updates the PnL for the current day."""
+# --- CHANGE 3: Modify update_pnl to accept a connection object ---
+def update_pnl(conn: sqlite3.Connection, pnl: float):
+    """Updates the PnL for the current day using the provided connection."""
+    
+    # --- НАША ОТЛАДОЧНАЯ ЛОВУШКА ---
+    now = datetime.now().strftime("%H:%M:%S.%f")
+    print(f"\nDEBUG_TRAP [{now}]: update_pnl CALLED! PNL = {pnl}\n")
+    # ---------------------------------
+    
     today = date.today()
-    conn = get_db_connection()
-    conn.execute('''
-        INSERT INTO daily_pnl (trade_date, realised_pnl)
-        VALUES (?, ?)
-        ON CONFLICT(trade_date) DO UPDATE SET
-        realised_pnl = realised_pnl + excluded.realised_pnl;
-    ''', (today, pnl))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            conn.execute('''
+                INSERT INTO daily_pnl (trade_date, realised_pnl)
+                VALUES (?, ?)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                realised_pnl = realised_pnl + excluded.realised_pnl;
+            ''', (today, pnl))
+    except Exception as e:
+        print(f"ERROR in update_pnl: {e}")
 
 🔹 File: risk_sizer.py
 ----------------------------------------------
@@ -699,6 +1145,53 @@ def calculate_position_size(
         # Для дробных - вычисляем количество знаков из шага
         decimal_places = -int(math.log10(amount_precision_step))
         return round(position_size, decimal_places)
+
+🔹 File: signal_parser.py
+----------------------------------------------
+# file: signal_parser.py
+import re
+import hashlib
+from typing import Optional
+from models import TradeInstruction
+
+def parse_pentagon_signal(text: str) -> Optional[TradeInstruction]:
+    """Парсит текстовый сигнал и возвращает структурированный объект TradeInstruction."""
+    try:
+        side_match = re.search(r'(лонг|шорт)', text, re.IGNORECASE)
+        side = 'long' if 'лонг' in side_match.group(0).lower() else 'short'
+
+        entry_match = re.search(r'(\d{4,6})-(\d{4,6})', text)
+        entry_start, entry_end = sorted([float(entry_match.group(1)), float(entry_match.group(2))])
+
+        sl_match = re.search(r'стоп\s*(?:под|над)?\s*(\d+\.?\d*)', text, re.IGNORECASE)
+        stop_loss = float(sl_match.group(1))
+
+        risk_match = re.search(r'риском\s+([\d.]+)\s*%\s*\((\d\/\d)\)', text, re.IGNORECASE)
+        risk_pct = float(risk_match.group(1)) / 100
+        num, den = map(int, risk_match.group(2).split('/'))
+        size_fraction = num / den
+
+        targets_block_match = re.search(r'Цели:([\s\S]*?)(?:\n\n|\Z)', text, re.IGNORECASE)
+        targets_block = targets_block_match.group(1)
+        take_profits = [float(tp) for tp in re.findall(r'(\d{4,6})', targets_block)]
+        if not take_profits:
+            raise ValueError("No take profits found in signal")
+
+        signal_id = hashlib.md5(text.encode()).hexdigest()
+
+        return TradeInstruction(
+            signal_id=signal_id,
+            side=side,
+            entry_start=entry_start,
+            entry_end=entry_end,
+            stop_loss=stop_loss,
+            risk_pct=risk_pct,
+            size_fraction=size_fraction,
+            take_profits=take_profits,
+        )
+    except (AttributeError, ValueError, IndexError) as e:
+        print(f"Signal parsing failed: {e}")
+        return None
 
 🔹 File: spring_model.py
 ----------------------------------------------
@@ -764,106 +1257,119 @@ def bounce_prob(
 
 🔹 File: tests/conftest.py
 ----------------------------------------------
-# File: tests/conftest.py
+# file: tests/conftest.py
 import pytest
-from unittest.mock import AsyncMock, MagicMock
-
-@pytest.fixture
-def mock_bybit_client_main(monkeypatch):
-    mock_client = AsyncMock()
-    mock_client.get_usdt_balance.return_value = 1000.0
-    mock_client.create_market_order_with_sl.return_value = {"id": "12345"}
-    
-    # ИЗМЕНЕНО: get_market_precision теперь синхронный мок
-    mock_client.get_market_precision = MagicMock(
-        return_value={"amount": 0.001, "price": 0.01}
-    )
-    
-    mock_client.fetch_open_positions.return_value = {
-        'BTCUSDT': {'symbol': 'BTCUSDT', 'contracts': 1.0}
-    }
-    
-    monkeypatch.setattr('main.bybit_client', mock_client)
-    
-    return mock_client
-
-🔹 File: tests/test_api_execute.py
-----------------------------------------------
-import pytest
-from fastapi.testclient import TestClient
 import os
+import sqlite3
+from unittest.mock import AsyncMock, MagicMock  # <-- Import MagicMock
+from fastapi.testclient import TestClient
+from datetime import datetime, timezone        # <-- ADD THIS LINE
 
-# Импортируем app, моки будут применены через conftest
-from main import app
-client = TestClient(app)
+TEST_DB_FILE = "test_app_db.sqlite"
 
-# Эта фикстура теперь только мокирует логирование
-@pytest.fixture(autouse=True)
-def setup_common_mocks(mocker):
-    """Общие моки для всех тестов в этом файле."""
-    mocker.patch('main.log_signal')
-    mocker.patch('main.log_event')
+@pytest.fixture(scope="function", autouse=True)
+def setup_for_every_test(monkeypatch, mocker):
+    # 1. Isolate the database by deleting files
+    monkeypatch.setenv("DATABASE_FILE", TEST_DB_FILE)
+    if os.path.exists(TEST_DB_FILE): os.remove(TEST_DB_FILE)
+    if os.path.exists(f"{TEST_DB_FILE}-shm"): os.remove(f"{TEST_DB_FILE}-shm")
+    if os.path.exists(f"{TEST_DB_FILE}-wal"): os.remove(f"{TEST_DB_FILE}-wal")
+    
+    # 2. Setup schema in the new, clean file
+    from db_setup import setup_database
+    setup_database()
+
+    # 3. Mock external services
+    mock_main_bybit_client = AsyncMock(name="main_bybit_client_mock")
+    mock_main_bybit_client.set_sandbox_mode = MagicMock()
+    mock_main_bybit_client.init.return_value = None
+    mock_main_bybit_client.get_usdt_balance.return_value = 1000.0
+    mock_main_bybit_client.get_market_precision.return_value = {'amount': 0.001, 'price': 0.01}
+    mock_main_bybit_client.fetch_open_positions.return_value = {}
+    mock_main_bybit_client.fetch_my_trades.return_value = []
+    mocker.patch('main.bybit_client', new=mock_main_bybit_client)
+
+    mocker.patch('main.position_manager_loop', new_callable=AsyncMock)
+    mocker.patch('main.place_entry_grid', new_callable=AsyncMock)
+    
     yield
 
-def test_execute_trade_calls_all_methods_correctly(mock_bybit_client_main):
-    """
-    Тестирует, что эндпоинт /execute корректно вызывает всю цепочку методов:
-    1. get_market_precision
-    2. get_usdt_balance
-    3. set_margin_mode
-    4. set_leverage
-    5. create_market_order_with_sl
-    """
-    signal = {"symbol": "BTCUSDT", "side": "long", "entry": 53000, "sl": 52500, "tp": 54000}
-    
-    # Сбрасываем счетчики вызовов мока перед тестом
-    mock_bybit_client_main.reset_mock()
-    
-    response = client.post("/execute", json=signal)
-    
-    # 1. Проверяем, что ответ успешный
-    assert response.status_code == 200, response.json()
-    data = response.json()
-    assert data["accepted"] is True
-    assert data["order"]["id"] == "12345"
+@pytest.fixture
+def test_app_client():
+    """Provides a TestClient to the app. The app is now safe to use
+    because the autouse fixture has already cleaned and mocked everything."""
+    from main import app
+    with TestClient(app) as client:
+        yield client
 
-    # 2. Проверяем, что все нужные методы wrapper'а были вызваны, и именно в этом порядке
-    call_order = [call[0] for call in mock_bybit_client_main.method_calls]
-    expected_order = [
-        'get_market_precision',
-        'get_usdt_balance',
-        'set_margin_mode',
-        'set_leverage',
-        'create_market_order_with_sl'
+# This fixture is for non-API tests that need a standalone mock client.
+# It's different from the one used by the app, ensuring no cross-contamination.
+@pytest.fixture
+def mock_bybit_client():
+    """
+    Provides a standalone mock client for non-API unit tests.
+    """
+    client = AsyncMock(name="standalone_mock_bybit_client")
+    client.get_market_precision.return_value = {'amount': 0.001, 'price': 0.01}
+    client.create_order.return_value = {"id": "stop_loss_order_1"}
+    
+    # --- ИСПРАВЛЕНИЕ ДЛЯ PNL ---
+    # Симулируем, что fetch_my_trades возвращает одну сделку с нулевой комиссией.
+    # Это позволит get_realized_pnl вернуть 0.0, а не ошибку.
+    client.fetch_my_trades.return_value = [
+        {'timestamp': datetime.now(timezone.utc).timestamp() * 1000, 'fee': {'cost': 0.0}}
     ]
-    assert call_order == expected_order
+    # ---------------------------
 
-    # 3. Проверяем аргументы ключевых вызовов
-    mock_bybit_client_main.get_market_precision.assert_called_once_with("BTC/USDT:USDT")
-    mock_bybit_client_main.set_margin_mode.assert_called_once_with("BTC/USDT:USDT", "isolated")
-    mock_bybit_client_main.set_leverage.assert_called_once_with("BTC/USDT:USDT", 10)
-    mock_bybit_client_main.create_market_order_with_sl.assert_called_once()
+    return client
 
-🔹 File: tests/test_api_utils.py
+🔹 File: tests/test_api_process_signal.py
 ----------------------------------------------
-# File: tests/test_api_utils.py
+# file: tests/test_api_process_signal.py
 import pytest
-from fastapi.testclient import TestClient
-from main import app
+from unittest.mock import AsyncMock
+from db_utils import get_db_connection
 
-client = TestClient(app)
 
-def test_ping():
-    response = client.get("/ping")
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+VALID_SIGNAL_TEXT = "🔴пробую шорт 109200-110500 и риском 0.5% (1/2) стоп над 111500\nЦели: 109000"
 
-def test_open_positions_returns_dict(mock_bybit_client_main): # Используем фикстуру
-    response = client.get('/open_positions')
-    assert response.status_code == 200
+def test_api_db_is_clean_before_run(test_app_client):
+    """
+    Verifies that the database is clean at the start of an API test.
+    The app factory pattern ensures no state leaks from previous tests.
+    """
+    conn = get_db_connection()
+    try:
+        pnl_record = conn.execute("SELECT * FROM daily_pnl").fetchone()
+    finally:
+        conn.close()
+    
+    assert pnl_record is None, "The daily_pnl table should be empty."
+
+def test_process_signal_creates_trade_in_db(test_app_client, mock_place_entry_grid):
+    """
+    Tests the full API endpoint flow from signal to DB record.
+    """
+    response = test_app_client.post("/process_signal", params={"raw_text": VALID_SIGNAL_TEXT})
+
+    assert response.status_code == 202, f"API returned an unexpected status. Body: {response.text}"
     data = response.json()
-    assert "BTCUSDT" in data
-    assert data['BTCUSDT']['contracts'] == 1.0
+    assert data['status'] == 'accepted'
+    trade_id = data['trade_id']
+
+    conn = get_db_connection()
+    try:
+        trade_in_db = conn.execute("SELECT * FROM managed_trades WHERE id = ?", (trade_id,)).fetchone()
+    finally:
+        conn.close()
+    
+    assert trade_in_db is not None
+    assert trade_in_db['status'] == 'PENDING_ENTRY'
+    assert trade_in_db['side'] == 'short'
+
+    mock_place_entry_grid.assert_called_once()
+    args, _ = mock_place_entry_grid.call_args
+    assert args[0] == trade_id
 
 🔹 File: tests/test_backtest_runner.py
 ----------------------------------------------
@@ -916,7 +1422,7 @@ def mock_exchange():
     """Фикстура, создающая мок-объект для ccxt.exchange."""
     exchange = AsyncMock()
     exchange.load_markets.return_value = None
-    exchange.set_sandbox_mode.return_value = None
+    exchange.set_sandbox_mode = MagicMock(return_value=None) # <-- MODIFY THIS LINE
     exchange.fetch_balance.return_value = {
         'USDT': {'free': 1000.0, 'used': 0.0, 'total': 1000.0}
     }
@@ -976,87 +1482,272 @@ async def test_create_order_insufficient_funds(mock_exchange, mocker):
     assert error_message in result['error']
     mock_log.assert_called_once()
 
+🔹 File: tests/test_position_manager.py
+----------------------------------------------
+# file: tests/test_position_manager.py
+import pytest
+import json
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock
+
+# Импортируем тестируемую функцию
+from position_manager import reconcile_and_manage
+# Импортируем утилиту для получения соединения
+from db_utils import get_db_connection
+
+# --- Вспомогательная функция для создания тестовых сделок в БД ---
+
+def create_test_trade_in_db(status='PENDING_ENTRY', avg_price=None, sl_price=85.0, sl_order_id=None, remaining_tps='[110, 120]', move_sl_idx=1, total_qty=1.0):
+    """
+    Создает запись о сделке в БД и возвращает ее ID.
+    Эта функция сама управляет своим соединением с БД.
+    """
+    conn = get_db_connection()
+    try:
+        now_utc_iso = datetime.now(timezone.utc).isoformat()
+        cursor = conn.cursor()
+        # Добавляем все необходимые поля, чтобы избежать ошибок
+        initial_tps_json = json.dumps([110, 120])
+        remaining_tps_json = remaining_tps if isinstance(remaining_tps, str) else json.dumps(remaining_tps)
+        
+        cursor.execute("""
+            INSERT INTO managed_trades (
+                instruction_id, symbol, side, status, entry_range_start, entry_range_end,
+                total_qty, avg_entry_price, initial_sl_price, current_sl_price, exchange_sl_order_id,
+                initial_tps, remaining_tps, move_sl_to_be_after_tp_index, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'sig1', 'BTCUSDT', 'long', status, 90.0, 100.0, total_qty, avg_price, 85.0, sl_price,
+            sl_order_id, initial_tps_json, remaining_tps_json, move_sl_idx, now_utc_iso, now_utc_iso
+        ))
+        trade_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    return trade_id
+
+# === Группа тестов для функции reconcile_and_manage ===
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_to_active(mock_bybit_client):
+    """
+    Тестирует переход сделки из PENDING_ENTRY в ACTIVE.
+    """
+    # 1. Подготовка: создаем сделку и ордер в чистой БД.
+    # Фикстура `setup_for_every_test` гарантирует, что БД чиста.
+    trade_id = create_test_trade_in_db(status='PENDING_ENTRY')
+    
+    conn = get_db_connection()
+    try:
+        # Используем уникальный ID для ордера, который не будет конфликтовать
+        conn.execute("INSERT INTO entry_orders (trade_id, exchange_order_id, status) VALUES (?, ?, 'open')", (trade_id, f"entry_order_{trade_id}"))
+        conn.commit()
+        trade_before = dict(conn.execute("SELECT * FROM managed_trades WHERE id = ?", (trade_id,)).fetchone())
+    finally:
+        conn.close()
+
+    # 2. Симуляция: "на бирже" появилась открытая позиция
+    live_position_mock = {
+        'symbol': 'BTCUSDT',
+        'entryPrice': '95.5',
+        'contracts': '0.5',
+        'markPrice': '96.0'
+    }
+    
+    # 3. Действие: вызываем тестируемую функцию
+    await reconcile_and_manage(trade_before, live_position_mock, mock_bybit_client)
+
+    # 4. Проверка результата
+    conn = get_db_connection()
+    try:
+        trade_after = dict(conn.execute("SELECT * FROM managed_trades WHERE id = ?", (trade_id,)).fetchone())
+    finally:
+        conn.close()
+    
+    assert trade_after['status'] == 'ACTIVE'
+    assert trade_after['avg_entry_price'] == 95.5
+    assert trade_after['executed_qty'] == 0.5
+    # mock_bybit_client из conftest.py возвращает 'stop_loss_order_1'
+    assert trade_after['exchange_sl_order_id'] == 'stop_loss_order_1' 
+    mock_bybit_client.cancel_order.assert_called_once_with(f"entry_order_{trade_id}", 'BTCUSDT')
+
+@pytest.mark.asyncio
+async def test_reconcile_active_to_closed(mock_bybit_client):
+    """
+    Тестирует переход сделки из ACTIVE в CLOSED.
+    """
+    trade_id = create_test_trade_in_db(status='ACTIVE', avg_price=95.0)
+    
+    conn = get_db_connection()
+    trade_before = dict(conn.execute("SELECT * FROM managed_trades WHERE id = ?", (trade_id,)).fetchone())
+    conn.close()
+
+    live_position_mock = None
+    
+    await reconcile_and_manage(trade_before, live_position_mock, mock_bybit_client)
+
+    conn = get_db_connection()
+    trade_after = dict(conn.execute("SELECT * FROM managed_trades WHERE id = ?", (trade_id,)).fetchone())
+    conn.close()
+
+    # Теперь эта проверка должна пройти, так как get_realized_pnl не вызовет ошибку
+    assert trade_after['status'] == 'CLOSED'
+    assert trade_after['close_reason'] is not None
+
+@pytest.mark.asyncio
+async def test_reconcile_moves_sl_to_breakeven(mock_bybit_client):
+    """
+    Тестирует перемещение стоп-лосса в безубыток.
+    """
+    # --- ИСПРАВЛЕНИЕ ОШИБКИ ---
+    # Заменяем pytest.AsyncMock на AsyncMock из unittest.mock
+    mock_bybit_client.edit_order = AsyncMock(return_value={"id": "sl_edited_456"})
+    # ---------------------------
+    
+    trade_id = create_test_trade_in_db(
+        status='ACTIVE', avg_price=95.0, sl_price=85.0,
+        sl_order_id='sl_initial_123', remaining_tps='[120]', move_sl_idx=1
+    )
+    
+    conn = get_db_connection()
+    trade_before = dict(conn.execute("SELECT * FROM managed_trades WHERE id = ?", (trade_id,)).fetchone())
+    conn.close()
+
+    live_position_mock = {
+        'symbol': 'BTCUSDT', 'entryPrice': '95.0',
+        'contracts': '0.5', 'markPrice': '115.0'
+    }
+    
+    await reconcile_and_manage(trade_before, live_position_mock, mock_bybit_client)
+
+    conn = get_db_connection()
+    trade_after = dict(conn.execute("SELECT * FROM managed_trades WHERE id = ?", (trade_id,)).fetchone())
+    conn.close()
+
+    assert trade_after['current_sl_price'] == trade_after['avg_entry_price']
+    
+    mock_bybit_client.edit_order.assert_called_once_with(
+        'sl_initial_123', 'BTCUSDT', 95.0
+    )
+
 🔹 File: tests/test_risk_controls.py
 ----------------------------------------------
+# file: tests/test_risk_controls.py
 import pytest
-import sqlite3
-import os
 import numpy as np
 from datetime import date
 from fastapi import HTTPException
 
-# Import the module itself to allow monkeypatching
-import risk_controls
-# Import the functions we need to call
-from risk_controls import check_daily_drawdown, update_pnl, get_db_connection
+# Импортируем тестируемые функции
+from risk_controls import check_daily_drawdown, update_pnl
+# Импортируем утилиту для получения соединения
+from db_utils import get_db_connection
 
-TEST_DB = "test_trades_isolated.sqlite"
-
-@pytest.fixture(autouse=True)
-def setup_teardown_db(monkeypatch):
-    """
-    This fixture is now robust and guarantees test isolation.
-    """
-    # 1. Use monkeypatch to temporarily change the DATABASE_FILE constant
-    #    within the risk_controls module for the duration of one test.
-    monkeypatch.setattr(risk_controls, "DATABASE_FILE", TEST_DB)
-
-    # 2. Clean up any previous test database file before the test starts.
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
-    
-    # 3. Initialize a fresh table for this specific test.
-    risk_controls.initialize_pnl_table()
-    
-    yield  # Run the test
-
-    # 4. Clean up the database file after the test is done.
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
-
-
-# A dummy async function to be decorated
+# Вспомогательная функция для тестирования декоратора
 @check_daily_drawdown(max_loss_pct=0.03)
-async def dummy_trade_route():
-    return {"status": "trade allowed"}
+async def dummy_protected_function():
+    return {"status": "allowed"}
 
-@pytest.mark.asyncio
-async def test_dd_within_limit():
-    update_pnl(-10.0) # Loss is < 3% of 1000
-    response = await dummy_trade_route()
-    assert response == {"status": "trade allowed"}
-
-@pytest.mark.asyncio
-async def test_dd_at_limit():
-    update_pnl(-30.0)
-    with pytest.raises(HTTPException) as excinfo:
-        await dummy_trade_route()
-    assert excinfo.value.status_code == 429
-
-@pytest.mark.asyncio
-async def test_dd_exceeds_limit():
-    update_pnl(-35.0)
-    with pytest.raises(HTTPException) as excinfo:
-        await dummy_trade_route()
-    assert excinfo.value.status_code == 429
-    # This assertion will now pass because the PnL is isolated.
-    assert "-35.00" in excinfo.value.detail
-
-@pytest.mark.asyncio
-async def test_no_pnl_for_today():
-    # PnL starts at 0 for this test, so it is allowed.
-    response = await dummy_trade_route()
-    assert response == {"status": "trade allowed"}
-
-def test_update_pnl_idempotency():
-    update_pnl(10.5)
-    update_pnl(-5.5)
-    
+# ==================== ДИАГНОСТИЧЕСКИЕ ТЕСТЫ ====================
+def test_initial_state_is_clean():
+    """
+    Этот тест должен выполняться ПЕРВЫМ.
+    Он проверяет, что таблица daily_pnl пуста в начале.
+    """
+    print("\n[DIAGNOSTIC] Running test_initial_state_is_clean...")
     conn = get_db_connection()
-    pnl = conn.execute("SELECT realised_pnl FROM daily_pnl WHERE trade_date = ?", (date.today(),)).fetchone()['realised_pnl']
-    conn.close()
-    # This will now correctly be 5.0, not an accumulated value.
-    assert np.isclose(pnl, 5.0)
+    try:
+        pnl_record = conn.execute("SELECT * FROM daily_pnl").fetchone()
+    finally:
+        conn.close()
+    
+    assert pnl_record is None, "ДИАГНОСТИКА: Таблица daily_pnl НЕ пуста в начале!"
+
+# === Группа тестов для декоратора check_daily_drawdown ===
+
+@pytest.mark.asyncio
+async def test_dd_allows_when_no_pnl():
+    """Проверяет: разрешает вход, если PnL за сегодня еще нет."""
+    # БД чистая благодаря фикстуре, поэтому PnL = 0
+    response = await dummy_protected_function()
+    assert response == {"status": "allowed"}
+
+@pytest.mark.asyncio
+async def test_dd_allows_when_within_limit():
+    """Проверяет: разрешает вход, если убыток в пределах лимита."""
+    conn = get_db_connection()
+    try:
+        update_pnl(conn, -10.0) # Записываем PnL = -10
+    finally:
+        conn.close()
+    
+    # dummy_protected_function увидит PnL = -10.0, что меньше лимита
+    response = await dummy_protected_function()
+    assert response == {"status": "allowed"}
+
+@pytest.mark.asyncio
+async def test_dd_rejects_when_at_limit():
+    """Проверяет: блокирует вход, если убыток равен лимиту."""
+    conn = get_db_connection()
+    try:
+        update_pnl(conn, -30.0) # Записываем PnL = -30 (равен лимиту)
+    finally:
+        conn.close()
+        
+    with pytest.raises(HTTPException) as exc_info:
+        await dummy_protected_function()
+    assert exc_info.value.status_code == 429
+
+@pytest.mark.asyncio
+async def test_dd_rejects_when_exceeds_limit():
+    """Проверяет: блокирует вход, если убыток превышает лимит."""
+    conn = get_db_connection()
+    try:
+        update_pnl(conn, -35.0) # Записываем PnL = -35
+    finally:
+        conn.close()
+        
+    with pytest.raises(HTTPException) as exc_info:
+        await dummy_protected_function()
+        
+    assert exc_info.value.status_code == 429
+    # Проверяем, что в сообщении об ошибке указан правильный PnL
+    assert "-35.00" in exc_info.value.detail
+
+
+# === Группа тестов для функции update_pnl ===
+
+def test_update_pnl_accumulates_correctly():
+    """Проверяет, что update_pnl корректно суммирует PnL за день."""
+    conn = get_db_connection()
+    try:
+        # Эти операции происходят в чистой базе данных
+        update_pnl(conn, 10.5)
+        update_pnl(conn, -5.5)
+        update_pnl(conn, 2.0)
+        row = conn.execute("SELECT realised_pnl FROM daily_pnl WHERE trade_date = ?", (date.today(),)).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    pnl = row['realised_pnl']
+    # Значение будет ровно 7.0, так как нет "грязных" данных из других тестов
+    assert np.isclose(pnl, 7.0)
+
+def test_final_state_is_also_clean():
+    """
+    Этот тест должен выполняться ПОСЛЕДНИМ в этом файле.
+    Он проверяет, осталось ли что-то в таблице после других тестов.
+    """
+    print("\n[DIAGNOSTIC] Running test_final_state_is_also_clean...")
+    conn = get_db_connection()
+    try:
+        pnl_record = conn.execute("SELECT * FROM daily_pnl").fetchone()
+    finally:
+        conn.close()
+    
+    assert pnl_record is None, "ДИАГНОСТИКА: Таблица daily_pnl НЕ пуста в конце!"
+# =================================================================
 
 🔹 File: tests/test_risk_sizer.py
 ----------------------------------------------
@@ -1088,6 +1779,45 @@ def test_calculate_position_size_zero_price_diff():
     size = calculate_position_size(60000.0, 60000.0, 1000.0, amount_precision_step=0.001)
     assert size == 0.0
 
+
+🔹 File: tests/test_signal_parser.py
+----------------------------------------------
+# file: tests/test_signal_parser.py
+import pytest
+from signal_parser import parse_pentagon_signal
+
+# Пример успешного сигнала
+VALID_SIGNAL_TEXT = """
+🔴пробую шорт 109200-110500 и риском 0.5% (1/2) стоп над 111500, после 2ого тейка в бу
+Цели: 
+109000-108800-108600
+"""
+
+# Пример сигнала с ошибкой (нет тейков)
+INVALID_SIGNAL_TEXT = "🔴пробую шорт 109200-110500 и риском 0.5% (1/2) стоп над 111500"
+
+def test_parse_valid_signal_success():
+    """Тестирует успешный парсинг корректного сигнала."""
+    instruction = parse_pentagon_signal(VALID_SIGNAL_TEXT)
+    
+    assert instruction is not None
+    assert instruction.side == 'short'
+    assert instruction.entry_start == 109200.0
+    assert instruction.entry_end == 110500.0
+    assert instruction.stop_loss == 111500.0
+    assert instruction.risk_pct == pytest.approx(0.005)
+    assert instruction.size_fraction == pytest.approx(0.5)
+    assert instruction.take_profits == [109000.0, 108800.0, 108600.0]
+
+def test_parse_invalid_signal_returns_none():
+    """Тестирует, что парсер возвращает None для некорректного сигнала."""
+    instruction = parse_pentagon_signal(INVALID_SIGNAL_TEXT)
+    assert instruction is None
+
+def test_parse_empty_string_returns_none():
+    """Тестирует обработку пустой строки."""
+    instruction = parse_pentagon_signal("")
+    assert instruction is None
 
 🔹 File: tests/test_spring_model.py
 ----------------------------------------------
@@ -1143,116 +1873,157 @@ def test_invalid_side(synthetic_bars):
 
 🔹 File: tests/test_trade_logger.py
 ----------------------------------------------
-# File: tests/test_trade_logger.py (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# file: tests/test_trade_logger.py
 import pytest
-import os
-from datetime import datetime
-import trade_logger
+import json
 
-TEST_DB = "test_log_final.sqlite"
+# Импортируем тестируемые функции
+from trade_logger import log_signal, log_trade_execution, log_event
+from db_utils import get_db_connection
 
-@pytest.fixture(autouse=True)
-def setup_teardown_db(monkeypatch):
-    monkeypatch.setattr(trade_logger, "DATABASE_FILE", TEST_DB)
-    monkeypatch.setattr(trade_logger, "_db_instance", None)
-    
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
-    yield
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
+# Эта строка применит фикстуру clean_db ко всем тестам в файле
+pytestmark = pytest.mark.usefixtures("setup_for_every_test")
 
-def test_log_signal():
-    signal_data = {
-        'pair': 'BTC/USDT:USDT',
-        'side': 'long',
-    }
-    trade_logger.log_signal(signal_data)
-    db = trade_logger.get_db()
-    log_entry = list(db["trade_log"].rows)[0]
-    assert log_entry["event_type"] == "SIGNAL_RECEIVED"
-    assert log_entry["pair"] == "BTC/USDT:USDT"
+# Добавляем фикстуру db_conn в аргументы теста
+def test_log_signal_creates_correct_record(): # REMOVE db_conn
+    """
+    Tests that log_signal correctly creates a record in the DB.
+    """
+    signal_data = {'symbol': 'BTCUSDT', 'side': 'long'}
+    log_signal(signal_data)
 
-def test_log_successful_execution():
-    order_data = {
-        'id': '123456789', 'cid': 'my_client_id_001', 'symbol': 'BTC/USDT:USDT',
-        'side': 'buy', 'amount': 0.001, 'price': 60100.0,
-        'status': 'open', 'error': None
-    }
-    trade_logger.log_trade_execution(order_data)
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = 'SIGNAL_RECEIVED'").fetchone()
+    finally:
+        conn.close()
 
-    db = trade_logger.get_db()
-    log_entry = list(db["trade_log"].rows)[0]
+    assert log_entry is not None
+    assert log_entry['event_type'] == 'SIGNAL_RECEIVED'
+    payload = json.loads(log_entry['payload_json'])
+    assert payload['symbol'] == 'BTCUSDT'
 
-    assert log_entry["event_type"] == "ORDER_PLACED"
-    # ИЗМЕНЕНО: Проверяем ключ 'id', который приходит от CCXT и записывается в лог
-    assert log_entry["id"] == '123456789' 
-    assert log_entry["error"] is None
+
+def test_log_successful_trade_execution(): # REMOVE db_conn
+    """
+    Tests logging of a successful order placement.
+    """
+    order_data = {'id': '123', 'error': None}
+    log_trade_execution(order_data)
+
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = 'ORDER_PLACED'").fetchone()
+    finally:
+        conn.close()
+
+    assert log_entry is not None
+    assert log_entry['event_type'] == 'ORDER_PLACED'
+
+
+def test_log_failed_trade_execution(): # REMOVE db_conn
+    """
+    Tests logging of a failed order placement.
+    """
+    order_data = {'error': 'InsufficientFunds'}
+    log_trade_execution(order_data)
+
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = 'ORDER_FAILED'").fetchone()
+    finally:
+        conn.close()
+
+    assert log_entry is not None
+    assert log_entry['event_type'] == 'ORDER_FAILED'
+
+
+def test_log_event_generic(): # REMOVE db_conn
+    """Tests the generic log_event function."""
+    event_type = "CUSTOM_TEST_EVENT"
+    payload_data = {"key": "value"}
+    log_event(event_type, payload_data)
+
+    conn = get_db_connection()
+    try:
+        log_entry = conn.execute("SELECT * FROM trade_log WHERE event_type = ?", (event_type,)).fetchone()
+    finally:
+        conn.close()
+
+    assert log_entry is not None
+    payload = json.loads(log_entry['payload_json'])
+    assert payload['key'] == "value"
 
 🔹 File: trade_logger.py
 ----------------------------------------------
-import sqlite_utils
-import os
+# file: trade_logger.py
+import json
 from datetime import datetime, timezone
 
-DATABASE_FILE = os.getenv("TRADE_DB", "trades.sqlite")
-
-# Глобальный объект для хранения единственного экземпляра подключения
-_db_instance = None
-
-def get_db():
-    """
-    Возвращает единственный экземпляр подключения к базе данных (синглтон).
-    Это повышает производительность и безопасность в многопоточной среде.
-    """
-    global _db_instance
-    if _db_instance is None:
-        _db_instance = sqlite_utils.Database(DATABASE_FILE)
-    return _db_instance
+# Импортируем наш унифицированный коннектор к БД
+from db_utils import get_db_connection
 
 def log_event(event_type: str, payload: dict):
     """
+    Универсальная функция для логирования любого события в системе.
     Записывает событие в таблицу 'trade_log'.
+
+    Args:
+        event_type (str): Тип события (например, 'SIGNAL_RECEIVED', 'ORDER_PLACED').
+        payload (dict): Словарь с дополнительными данными о событии.
     """
-    db = get_db()
-    # pk="id" убран. sqlite-utils будет использовать стандартный rowid.
-    log_table = db.table("trade_log")
-    
-    record = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "event_type": event_type,
-    }
-    record.update(payload)
-    
-    log_table.insert(record, alter=True)
-    print(f"[LOG] Event '{event_type}': {payload}")
+    try:
+        conn = get_db_connection()
+        
+        # Преобразуем все значения в payload в строки, чтобы избежать ошибок сериализации
+        # сложных объектов (например, Decimal) и обеспечить консистентность.
+        serializable_payload = {k: str(v) for k, v in payload.items()}
+        payload_str = json.dumps(serializable_payload)
+
+        record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec='microseconds'),
+            "event_type": event_type,
+            "payload_json": payload_str
+        }
+        
+        # Используем `with conn:` для автоматического коммита или отката транзакции
+        with conn:
+            conn.execute(
+                "INSERT INTO trade_log (timestamp_utc, event_type, payload_json) VALUES (:timestamp_utc, :event_type, :payload_json)",
+                record
+            )
+        
+        print(f"[LOG] Event: {event_type} | Payload: {payload}")
+
+    except Exception as e:
+        # Критично важно не "уронить" приложение, если логирование не удалось.
+        # Просто выводим ошибку в консоль.
+        print(f"[LOGGING_ERROR] Failed to log event '{event_type}'. Error: {e}")
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+
 
 def log_signal(signal: dict):
-    """Логирует входящий торговый сигнал."""
+    """
+    Специализированная функция-хелпер для логирования входящего торгового сигнала.
+    """
     log_event("SIGNAL_RECEIVED", payload=signal)
 
-def log_trade_execution(order_result: dict):
-    """Логирует результат размещения ордера на бирже."""
-    payload = {
-        "client_order_id": order_result.get('cid'),
-        "exchange_order_id": order_result.get('id'),
-        "symbol": order_result.get('symbol'),
-        "side": order_result.get('side'),
-        "amount": order_result.get('amount'),
-        "price": order_result.get('price'),
-        "status": order_result.get('status'),
-        "error": order_result.get('error')
-    }
-    event_type = "ORDER_FAILED" if payload['error'] else "ORDER_PLACED"
-    log_event(event_type, payload=payload)
 
 def log_trade_execution(order_result: dict):
-    """Логирует результат размещения ордера на бирже."""
-    # Создаем копию, чтобы не изменять оригинальный объект от ccxt
+    """
+    Специализированная функция-хелпер для логирования результата размещения ордера.
+    Автоматически определяет тип события (успех/неудача) по наличию ключа 'error'.
+    """
+    # Создаем копию, чтобы не изменять оригинальный объект, который может еще использоваться
     payload = order_result.copy()
-    event_type = "ORDER_FAILED" if payload.get('error') else "ORDER_PLACED"
+    
+    # Определяем тип события
+    # Если в результате есть ключ 'error' и он не None/пустой, считаем это ошибкой
+    if payload.get('error'):
+        event_type = "ORDER_FAILED"
+    else:
+        event_type = "ORDER_PLACED"
+        
     log_event(event_type, payload=payload)
-
-def log_signal(signal: dict):
-    """Логирует входящий торговый сигнал."""
-    log_event("SIGNAL_RECEIVED", payload=signal)

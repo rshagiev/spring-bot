@@ -1,65 +1,71 @@
-import sqlite_utils
-import os
+# file: trade_logger.py
+import json
 from datetime import datetime, timezone
 
-DATABASE_FILE = os.getenv("TRADE_DB", "trades.sqlite")
-
-# Глобальный объект для хранения единственного экземпляра подключения
-_db_instance = None
-
-def get_db():
-    """
-    Возвращает единственный экземпляр подключения к базе данных (синглтон).
-    Это повышает производительность и безопасность в многопоточной среде.
-    """
-    global _db_instance
-    if _db_instance is None:
-        _db_instance = sqlite_utils.Database(DATABASE_FILE)
-    return _db_instance
+# Импортируем наш унифицированный коннектор к БД
+from db_utils import get_db_connection
 
 def log_event(event_type: str, payload: dict):
     """
+    Универсальная функция для логирования любого события в системе.
     Записывает событие в таблицу 'trade_log'.
+
+    Args:
+        event_type (str): Тип события (например, 'SIGNAL_RECEIVED', 'ORDER_PLACED').
+        payload (dict): Словарь с дополнительными данными о событии.
     """
-    db = get_db()
-    # pk="id" убран. sqlite-utils будет использовать стандартный rowid.
-    log_table = db.table("trade_log")
-    
-    record = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "event_type": event_type,
-    }
-    record.update(payload)
-    
-    log_table.insert(record, alter=True)
-    print(f"[LOG] Event '{event_type}': {payload}")
+    try:
+        conn = get_db_connection()
+        
+        # Преобразуем все значения в payload в строки, чтобы избежать ошибок сериализации
+        # сложных объектов (например, Decimal) и обеспечить консистентность.
+        serializable_payload = {k: str(v) for k, v in payload.items()}
+        payload_str = json.dumps(serializable_payload)
+
+        record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec='microseconds'),
+            "event_type": event_type,
+            "payload_json": payload_str
+        }
+        
+        # Используем `with conn:` для автоматического коммита или отката транзакции
+        with conn:
+            conn.execute(
+                "INSERT INTO trade_log (timestamp_utc, event_type, payload_json) VALUES (:timestamp_utc, :event_type, :payload_json)",
+                record
+            )
+        
+        print(f"[LOG] Event: {event_type} | Payload: {payload}")
+
+    except Exception as e:
+        # Критично важно не "уронить" приложение, если логирование не удалось.
+        # Просто выводим ошибку в консоль.
+        print(f"[LOGGING_ERROR] Failed to log event '{event_type}'. Error: {e}")
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+
 
 def log_signal(signal: dict):
-    """Логирует входящий торговый сигнал."""
+    """
+    Специализированная функция-хелпер для логирования входящего торгового сигнала.
+    """
     log_event("SIGNAL_RECEIVED", payload=signal)
 
-def log_trade_execution(order_result: dict):
-    """Логирует результат размещения ордера на бирже."""
-    payload = {
-        "client_order_id": order_result.get('cid'),
-        "exchange_order_id": order_result.get('id'),
-        "symbol": order_result.get('symbol'),
-        "side": order_result.get('side'),
-        "amount": order_result.get('amount'),
-        "price": order_result.get('price'),
-        "status": order_result.get('status'),
-        "error": order_result.get('error')
-    }
-    event_type = "ORDER_FAILED" if payload['error'] else "ORDER_PLACED"
-    log_event(event_type, payload=payload)
 
 def log_trade_execution(order_result: dict):
-    """Логирует результат размещения ордера на бирже."""
-    # Создаем копию, чтобы не изменять оригинальный объект от ccxt
+    """
+    Специализированная функция-хелпер для логирования результата размещения ордера.
+    Автоматически определяет тип события (успех/неудача) по наличию ключа 'error'.
+    """
+    # Создаем копию, чтобы не изменять оригинальный объект, который может еще использоваться
     payload = order_result.copy()
-    event_type = "ORDER_FAILED" if payload.get('error') else "ORDER_PLACED"
+    
+    # Определяем тип события
+    # Если в результате есть ключ 'error' и он не None/пустой, считаем это ошибкой
+    if payload.get('error'):
+        event_type = "ORDER_FAILED"
+    else:
+        event_type = "ORDER_PLACED"
+        
     log_event(event_type, payload=payload)
-
-def log_signal(signal: dict):
-    """Логирует входящий торговый сигнал."""
-    log_event("SIGNAL_RECEIVED", payload=signal)
