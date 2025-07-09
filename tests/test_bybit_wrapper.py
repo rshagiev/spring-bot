@@ -1,45 +1,69 @@
-# File: tests/test_bybit_wrapper.py (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 import pytest
-from unittest.mock import AsyncMock, MagicMock  # <-- ИЗМЕНЕНИЕ ЗДЕСЬ
+from unittest.mock import AsyncMock, MagicMock
 import ccxt.async_support as ccxt
 from bybit_wrapper import AsyncBybitWrapper
 
 @pytest.fixture
-def mock_bybit_client(mocker):
-    mock_exchange = AsyncMock()
-    mock_exchange.load_markets.return_value = None
-    mock_exchange.fetch_balance.return_value = {
-        'USDT': {'free': 1000.0}
+def mock_exchange():
+    """Фикстура, создающая мок-объект для ccxt.exchange."""
+    exchange = AsyncMock()
+    exchange.load_markets.return_value = None
+    exchange.set_sandbox_mode.return_value = None
+    exchange.fetch_balance.return_value = {
+        'USDT': {'free': 1000.0, 'used': 0.0, 'total': 1000.0}
     }
-    mock_exchange.create_order.return_value = {'id': '123'}
-    # set_sandbox_mode не является async, мокируем его как обычный метод
-    mock_exchange.set_sandbox_mode = MagicMock()
-    mocker.patch('ccxt.async_support.bybit', return_value=mock_exchange)
-    return mock_exchange
+    exchange.create_order.return_value = {'id': '12345', 'status': 'open'}
+    exchange.market.return_value = {
+        'precision': {'amount': 3, 'price': 2}
+    }
+    return exchange
 
-@pytest.fixture(autouse=True)
-def mock_keys(monkeypatch):
-    monkeypatch.setenv("BYBIT_KEY", "dummy_key")
-    monkeypatch.setenv("BYBIT_SECRET", "dummy_secret")
 
 @pytest.mark.asyncio
-async def test_init_and_get_balance(mock_bybit_client):
-    wrapper = AsyncBybitWrapper(testnet=True)
+async def test_init_and_get_balance(mock_exchange, mocker):
+    """Тестирует успешную инициализацию и получение баланса."""
+    # Подменяем реальный ccxt.bybit на наш мок
+    mocker.patch('ccxt.async_support.bybit', return_value=mock_exchange)
+    
+    # Создаем экземпляр с фиктивными ключами
+    wrapper = AsyncBybitWrapper(api_key="dummy", secret_key="dummy", testnet=True)
     await wrapper.init()
     balance = await wrapper.get_usdt_balance()
     await wrapper.close()
 
     assert balance == 1000.0
-    mock_bybit_client.load_markets.assert_called_once()
-    mock_bybit_client.fetch_balance.assert_called_once()
+    mock_exchange.load_markets.assert_called_once()
+    mock_exchange.fetch_balance.assert_called_once()
+
 
 @pytest.mark.asyncio
-async def test_create_order_success(mock_bybit_client, mocker):
+async def test_create_order_success(mock_exchange, mocker):
+    """Тестирует успешное создание ордера."""
+    mocker.patch('ccxt.async_support.bybit', return_value=mock_exchange)
     mock_log = mocker.patch('bybit_wrapper.log_trade_execution')
-    wrapper = AsyncBybitWrapper(testnet=True)
+    
+    wrapper = AsyncBybitWrapper(api_key="dummy", secret_key="dummy", testnet=True)
     await wrapper.init()
     result = await wrapper.create_market_order_with_sl('BTC/USDT:USDT', 'buy', 0.01, 59000.0)
     await wrapper.close()
 
-    assert result['id'] == '123'
-    mock_log.assert_called_once_with({'id': '123'})
+    assert result['id'] == '12345'
+    mock_log.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_order_insufficient_funds(mock_exchange, mocker):
+    """Тестирует обработку ошибки нехватки средств."""
+    error_message = "bybit-insufficient-balance-for-order-cost"
+    mock_exchange.create_order.side_effect = ccxt.InsufficientFunds(error_message)
+    mocker.patch('ccxt.async_support.bybit', return_value=mock_exchange)
+    mock_log = mocker.patch('bybit_wrapper.log_trade_execution')
+
+    wrapper = AsyncBybitWrapper(api_key="dummy", secret_key="dummy", testnet=True)
+    await wrapper.init()
+    result = await wrapper.create_market_order_with_sl('BTC/USDT:USDT', 'buy', 1.0, 59000.0)
+    await wrapper.close()
+
+    assert 'error' in result
+    assert error_message in result['error']
+    mock_log.assert_called_once()

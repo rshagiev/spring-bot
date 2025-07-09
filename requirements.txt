@@ -17,4 +17,9 @@ sqlite-utils==3.*
 pytest
 pytest-asyncio
 pytest-mock
-httpx  # <-- ДОБАВЛЕНО
+httpx 
+
+# UI & Dashboard
+streamlit
+streamlit-autorefresh
+python-dotenv

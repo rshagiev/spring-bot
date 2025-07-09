@@ -1,0 +1,1258 @@
+🧠 Python Project Dump for LLM — spring-bot
+📅 Date: Wed Jul  9 01:10:46 +05 2025
+📂 Path: /Users/rshagiev/PycharmProjects/spring-bot
+==============================================
+
+
+📁 Project Structure (tree -L 3):
+----------------------------------------------
+.
+├── backtest_runner.py
+├── bybit_wrapper.py
+├── check_keys.py
+├── dashboard.py
+├── dump_python_files.sh
+├── main.py
+├── project_dump.txt
+├── README.md
+├── requirements.txt
+├── risk_controls.py
+├── risk_sizer.py
+├── spring_model.py
+├── tests
+│   ├── __init__.py
+│   ├── conftest.py
+│   ├── test_api_execute.py
+│   ├── test_api_utils.py
+│   ├── test_backtest_runner.py
+│   ├── test_bybit_wrapper.py
+│   ├── test_risk_controls.py
+│   ├── test_risk_sizer.py
+│   ├── test_spring_model.py
+│   └── test_trade_logger.py
+├── trade_logger.py
+└── trades.sqlite
+
+2 directories, 24 files
+
+
+📦 requirements.txt:
+----------------------------------------------
+# Core Logic & Data
+pandas
+numpy
+
+# API & Web Services
+fastapi
+uvicorn
+aiofiles
+
+# Exchange Integration
+ccxt==4.*
+
+# Database
+sqlite-utils==3.*
+
+# Testing
+pytest
+pytest-asyncio
+pytest-mock
+httpx 
+
+# UI & Dashboard
+streamlit
+streamlit-autorefresh
+python-dotenv
+
+📝 Python Files:
+==============================================
+
+
+🔹 File: backtest_runner.py
+----------------------------------------------
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from itertools import product
+from spring_model import bounce_prob
+
+# --- Constants ---
+INITIAL_EQUITY = 1000.0
+RISK_PER_TRADE_PCT = 0.01
+FIXED_RR_RATIO = 1.5
+PROB_THRESHOLD = 0.5
+
+def run_backtest(price_df, signals_df, bb_window, bb_std_dev):
+    equity = INITIAL_EQUITY
+    equity_curve = [INITIAL_EQUITY]
+    trades = []
+
+    for _, signal in signals_df.iterrows():
+        # Find the price data available right before the signal
+        bars = price_df[price_df['ts'] < signal['ts']].tail(bb_window)
+        if len(bars) < bb_window:
+            continue
+
+        # 1. Filter signal through the spring model
+        prob = bounce_prob(bars, signal['side'], signal['entry'], bb_window, bb_std_dev)
+        if prob < PROB_THRESHOLD:
+            continue
+
+        # 2. Size the trade
+        risk_per_trade_usd = equity * RISK_PER_TRADE_PCT
+        stop_loss_dist = abs(signal['entry'] - signal['sl'])
+        if stop_loss_dist == 0: continue
+        position_size = risk_per_trade_usd / stop_loss_dist
+
+        # 3. Determine TP based on fixed R:R
+        take_profit_dist = stop_loss_dist * FIXED_RR_RATIO
+        if signal['side'] == 'long':
+            tp_price = signal['entry'] + take_profit_dist
+            sl_price = signal['sl']
+        else:
+            tp_price = signal['entry'] - take_profit_dist
+            sl_price = signal['sl']
+
+        # 4. Simulate trade execution
+        trade_data = price_df[price_df['ts'] >= signal['ts']]
+        pnl = 0
+        outcome = 'No fill'
+        for _, row in trade_data.iterrows():
+            if signal['side'] == 'long':
+                if row['high'] >= tp_price:
+                    pnl = (tp_price - signal['entry']) * position_size
+                    outcome = 'TP'
+                    break
+                if row['low'] <= sl_price:
+                    pnl = (sl_price - signal['entry']) * position_size
+                    outcome = 'SL'
+                    break
+            else: # short
+                if row['low'] <= tp_price:
+                    pnl = (signal['entry'] - tp_price) * position_size
+                    outcome = 'TP'
+                    break
+                if row['high'] >= sl_price:
+                    pnl = (signal['entry'] - sl_price) * position_size
+                    outcome = 'SL'
+                    break
+
+        if outcome in ['TP', 'SL']:
+            equity += pnl
+            equity_curve.append(equity)
+            trades.append({'pnl': pnl, 'outcome': outcome})
+    
+    return equity_curve, trades
+
+def calculate_metrics(equity_curve, num_days):
+    returns = pd.Series(equity_curve).pct_change().dropna()
+    total_return = (equity_curve[-1] / INITIAL_EQUITY) - 1
+    
+    # Max Drawdown
+    rolling_max = pd.Series(equity_curve).cummax()
+    drawdown = (pd.Series(equity_curve) - rolling_max) / rolling_max
+    max_drawdown = drawdown.min()
+    
+    # Sharpe Ratio (annualized)
+    daily_returns = returns[returns != 0]
+    if len(daily_returns) > 1 and daily_returns.std() != 0:
+        # NOTE: This is an approximate annualization, assuming trades are somewhat evenly distributed.
+        # It's suitable for comparing parameters but is not a perfectly rigorous Sharpe calculation.
+        sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * np.sqrt(365 * 24 * 60 / (num_days * 24 * 60 / len(daily_returns)) )
+    else:
+        sharpe_ratio = 0
+
+    return total_return, max_drawdown, sharpe_ratio
+
+if __name__ == '__main__':
+    # 1. Load data
+    try:
+        price_df = pd.read_csv('btc_1m.csv', names=['ts', 'open', 'high', 'low', 'close', 'volume'])
+        signals_df = pd.read_csv('signals.csv') # ts, side, entry, sl, tp
+    except FileNotFoundError as e:
+        print(f"Error: {e}. Make sure 'btc_1m.csv' (no header) and 'signals.csv' are present.")
+        exit()
+
+    # Ensure timestamps are numeric for comparison (OS-agnostic method)
+    price_df['ts'] = pd.to_datetime(price_df['ts']).view('int64') // 10**9
+    signals_df['ts'] = pd.to_datetime(signals_df['ts']).view('int64') // 10**9
+    num_days = (price_df['ts'].max() - price_df['ts'].min()) / (60 * 60 * 24)
+
+    # 5. Parameter Grid Search
+    bb_windows = [10, 20, 30]
+    bb_multipliers = [1.5, 2.0, 2.5]
+    results = []
+
+    print("Running backtest grid search...")
+    for window, mult in product(bb_windows, bb_multipliers):
+        equity_curve, trades = run_backtest(price_df, signals_df, window, mult)
+        if len(equity_curve) > 1:
+            total_r, max_dd, sharpe = calculate_metrics(equity_curve, num_days)
+            results.append(((window, mult), total_r, max_dd, sharpe, len(trades)))
+    
+    # Print results
+    print("\n--- Backtest Results ---")
+    print(f"{'Params (win, std)':<20} | {'Total Return':>15} | {'Max Drawdown':>15} | {'Sharpe Ratio':>15} | {'Num Trades':>12}")
+    print('-'*85)
+    sorted_results = sorted(results, key=lambda x: x[3], reverse=True) # Sort by Sharpe
+    for params, total_r, max_dd, sharpe, num_trades in sorted_results:
+        print(f"{str(params):<20} | {total_r:>14.2%} | {max_dd:>14.2%} | {sharpe:>15.2f} | {num_trades:>12}")
+
+    # Plot the best result
+    if sorted_results:
+        best_params = sorted_results[0][0]
+        print(f"\nPlotting equity curve for best params: {best_params}")
+        best_equity_curve, _ = run_backtest(price_df, signals_df, best_params[0], best_params[1])
+        plt.figure(figsize=(12, 6))
+        plt.plot(best_equity_curve)
+        plt.title(f'Equity Curve - Best Params: {best_params} (Sharpe: {sorted_results[0][3]:.2f})')
+        plt.xlabel('Trade Number')
+        plt.ylabel('Equity (USDT)')
+        plt.grid(True)
+        plt.savefig('equity_curve.png')
+        print("Saved equity curve to equity_curve.png")
+
+🔹 File: bybit_wrapper.py
+----------------------------------------------
+import ccxt.async_support as ccxt
+import os
+from trade_logger import log_trade_execution, log_event
+
+class AsyncBybitWrapper:
+    def __init__(self, api_key: str, secret_key: str, testnet: bool = True):
+        if not api_key or not secret_key:
+            raise ValueError("API key and secret must be provided.")
+        
+        self.testnet = testnet
+        self.exchange = ccxt.bybit({
+            'apiKey': api_key,
+            'secret': secret_key,
+            'options': {'defaultType': 'swap'},
+        })
+        if self.testnet:
+            self.exchange.set_sandbox_mode(True)
+
+    async def init(self):
+        try:
+            await self.exchange.load_markets()
+            print(f"Successfully connected to Bybit. Sandbox mode: {self.testnet}")
+        except Exception as e:
+            await self.close()
+            raise
+
+    async def close(self):
+        if self.exchange:
+            await self.exchange.close()
+
+    # --- ДОБАВЬТЕ ЭТИ ДВА МЕТОДА ---
+    async def set_leverage(self, symbol: str, leverage: int):
+        """Устанавливает кредитное плечо для указанного символа."""
+        try:
+            await self.exchange.set_leverage(leverage, symbol)
+            log_event("LEVERAGE_SET", {"symbol": symbol, "leverage": leverage})
+        except Exception as e:
+            log_event("LEVERAGE_ERROR", {"symbol": symbol, "error": str(e)})
+            # Можно не кидать исключение, если биржа позволяет торговать и так
+            print(f"Warning: Failed to set leverage for {symbol}: {e}")
+
+    async def set_margin_mode(self, symbol: str, margin_mode: str):
+        """Устанавливает режим маржи ('cross' или 'isolated')."""
+        try:
+            unified_symbol = symbol.split(':')[0]
+            await self.exchange.set_margin_mode(margin_mode, unified_symbol, params={'settleCoin': 'USDT'})
+            log_event("MARGIN_MODE_SET", {"symbol": symbol, "mode": margin_mode})
+        except Exception as e:
+            log_event("MARGIN_MODE_ERROR", {"symbol": symbol, "error": str(e)})
+            print(f"Warning: Failed to set margin mode for {symbol}: {e}")
+    # ------------------------------------
+
+    def get_market_precision(self, symbol: str) -> dict:
+        try:
+            market = self.exchange.market(symbol)
+            return {'price': market['precision']['price'], 'amount': market['precision']['amount']}
+        except (ccxt.BadSymbol, KeyError):
+            return None
+
+    async def get_usdt_balance(self) -> float:
+        try:
+            balance = await self.exchange.fetch_balance()
+            return float(balance.get('USDT', {}).get('total', 0.0))
+        except Exception as e:
+            return 0.0
+
+    async def fetch_open_positions(self) -> dict:
+        try:
+            positions = await self.exchange.fetch_positions()
+            return {p['info']['symbol']: p for p in positions if float(p.get('contracts', 0)) != 0}
+        except Exception:
+            return {}
+    
+    # --- ДОБАВЬТЕ ЭТОТ МЕТОД ---
+    async def fetch_ticker_price(self, symbol: str) -> float:
+        """Получает последнюю цену для тикера."""
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            return float(ticker['last'])
+        except Exception as e:
+            print(f"Error fetching ticker for {symbol}: {e}")
+            return 0.0
+    # ---------------------------
+
+    async def create_market_order_with_sl(self, symbol: str, side: str, amount: float, stop_loss_price: float) -> dict:
+        params = {'stopLoss': stop_loss_price}
+        try:
+            order = await self.exchange.create_order(symbol, 'market', side, amount, params=params)
+            log_trade_execution(order)
+            return order
+        except Exception as e:
+            error_payload = {'symbol': symbol, 'error': str(e)}
+            log_trade_execution(error_payload)
+            return error_payload
+
+🔹 File: check_keys.py
+----------------------------------------------
+# File: check_keys.py (ВЕРСИЯ С ХАРДКОДОМ)
+import os
+import asyncio
+import ccxt.async_support as ccxt
+# from dotenv import load_dotenv # Больше не нужно
+
+async def main():
+    # load_dotenv() # Больше не нужно
+    
+    # --- ВРЕМЕННО ВСТАВЛЯЕМ КЛЮЧИ ПРЯМО СЮДА ---
+    api_key = "Xyo4o0isLLDU1vaRlN"
+    secret = "L4BnWcl26eeeWYT3keMiKLtnFwmKm0tKQoJp"
+    # ---------------------------------------------
+
+    print(f"--- Checking Keys (Hardcoded) ---")
+    print(f"API Key used: {api_key}")
+    print("-" * 20)
+
+    exchange = ccxt.bybit({
+        'apiKey': api_key,
+        'secret': secret,
+    })
+    exchange.set_sandbox_mode(True)
+
+    try:
+        print("Attempting to fetch balance...")
+        balance = await exchange.fetch_balance()
+        print("\nSUCCESS! Connection is working.")
+        print(f"Available USDT Balance: {balance.get('USDT', {}).get('free', 0.0)}")
+    except ccxt.AuthenticationError as e:
+        print(f"\nERROR: Authentication failed. Bybit says: {e}")
+        print("This confirms the issue is with the keys themselves or their permissions on Bybit's side.")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
+    finally:
+        await exchange.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+🔹 File: dashboard.py
+----------------------------------------------
+# File: dashboard.py (ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ)
+import streamlit as st
+import pandas as pd
+import requests
+import sqlite3 # <-- Импортируем стандартный sqlite3
+import sqlite_utils
+import json
+import os
+from streamlit_autorefresh import st_autorefresh
+
+# --- Конфигурация ---
+API_BASE_URL = os.getenv("BOT_API_URL", "http://127.0.0.1:8000")
+DB_FILE = os.getenv("TRADE_DB", "trades.sqlite")
+REFRESH_INTERVAL_SECONDS = 5
+
+st.set_page_config(
+    page_title="Trading Bot Dashboard",
+    layout="wide",
+)
+
+# --- Автоматическое обновление страницы ---
+st_autorefresh(interval=REFRESH_INTERVAL_SECONDS * 1000, key="dashboard_refresh")
+
+# --- Функции для загрузки данных ---
+@st.cache_resource
+def get_db_conn():
+    """
+    Кеширует подключение к БД.
+    ИЗМЕНЕНО: Используем sqlite3 для создания потокобезопасного подключения.
+    """
+    try:
+        # Создаем подключение с помощью стандартной библиотеки, отключая проверку потока
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        # Оборачиваем его в объект sqlite_utils
+        return sqlite_utils.Database(conn)
+    except Exception as e:
+        st.error(f"Failed to connect to database: {DB_FILE}. Error: {e}")
+        return None
+
+@st.cache_data(ttl=REFRESH_INTERVAL_SECONDS)
+def get_open_positions():
+    """Запрашивает открытые позиции с нашего API."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/open_positions")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException:
+        return {}
+
+@st.cache_data(ttl=REFRESH_INTERVAL_SECONDS)
+def get_event_log(limit=20):
+    """Читает последние события из лога."""
+    db = get_db_conn()
+    if db is None or 'trade_log' not in db.table_names():
+        return []
+    try:
+        return list(db.table('trade_log').rows_where(order_by='id DESC', limit=limit))
+    except Exception:
+        return []
+
+# --- Основная структура дашборда ---
+st.title("🤖 LLM-Driven Trading Bot Dashboard")
+
+# --- Секция 1: Открытые Позиции ---
+st.subheader("📊 Open Positions")
+positions_data = get_open_positions()
+if positions_data:
+    positions_df = pd.DataFrame(list(positions_data.values()))
+    display_cols = {
+        'symbol': 'Symbol', 'side': 'Side', 'contracts': 'Size',
+        'entryPrice': 'Entry', 'markPrice': 'Mark', 'unrealizedPnl': 'uPNL'
+    }
+    existing_cols = [col for col in display_cols.keys() if col in positions_df.columns]
+    if existing_cols:
+        filtered_df = positions_df[existing_cols].rename(columns=display_cols)
+        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No open positions with required data.")
+else:
+    st.info("No open positions or API not reachable.")
+
+# --- Секция 2: Журнал Событий ---
+st.subheader("📜 Recent Events")
+log_data = get_event_log()
+if log_data:
+    log_df = pd.DataFrame(log_data)
+    if 'payload_json' in log_df.columns:
+        log_df['timestamp_utc'] = pd.to_datetime(log_df['timestamp_utc']).dt.strftime('%Y-%m-%d %H:%M:%S')
+        def pretty_payload(payload_str):
+            try: return json.loads(payload_str)
+            except: return payload_str
+        log_df['payload'] = log_df['payload_json'].apply(pretty_payload)
+        st.dataframe(
+            log_df[['timestamp_utc', 'event_type', 'payload']],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
+else:
+    st.warning("Event log is empty or database not found.")
+
+# --- Секция 3: Кривая капитала (заглушка) ---
+st.subheader("📈 Equity Curve (placeholder)")
+st.info("Equity curve will be implemented once PnL data is logged upon trade closure.")
+
+🔹 File: main.py
+----------------------------------------------
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any
+import time
+import os
+from dotenv import load_dotenv
+
+# --- Шаг 1: Явно загружаем переменные из .env файла ---
+load_dotenv()
+MAX_ENTRY_DEVIATION_PCT = 0.005  # Максимальное отклонение цены входа в процентах (0.5%)
+
+# --- Шаг 2: Импортируем наши модули ПОСЛЕ загрузки .env ---
+from bybit_wrapper import AsyncBybitWrapper
+from risk_sizer import calculate_position_size
+from risk_controls import check_daily_drawdown, initialize_pnl_table
+from trade_logger import log_signal, log_event
+
+# --- Pydantic Models for API validation ---
+class Signal(BaseModel):
+    symbol: str
+    side: str
+    entry: float
+    sl: float
+    tp: float
+
+# --- FastAPI App Initialization ---
+API_KEY = os.getenv("BYBIT_KEY")
+API_SECRET = os.getenv("BYBIT_SECRET")
+
+if not API_KEY or not API_SECRET:
+    print("FATAL ERROR: BYBIT_KEY and/or BYBIT_SECRET not found. Please check your .env file.")
+    exit()
+
+app = FastAPI(title="LLM-Driven Trading Bot", version="0.2.0")
+bybit_client = AsyncBybitWrapper(api_key=API_KEY, secret_key=API_SECRET, testnet=True)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initializes services when the application starts."""
+    initialize_pnl_table()
+    await bybit_client.init()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Closes the Bybit client connection when the application shuts down."""
+    await bybit_client.close()
+
+
+# --- API Endpoints ---
+@app.post("/execute")
+@check_daily_drawdown(max_loss_pct=0.03)
+async def execute_trade(signal: Signal):
+    """
+    Main endpoint for receiving and processing a trading signal.
+    Spring Model filter is DISABLED for this version.
+    """
+    log_signal(signal.model_dump())
+    
+    # Конвертируем символ для ccxt, e.g., 'BTCUSDT' -> 'BTC/USDT:USDT'
+    ccxt_symbol = f"{signal.symbol.replace('USDT', '')}/USDT:USDT"
+
+    # --- НОВЫЙ ШАГ: ПРОВЕРКА ЦЕНЫ ВХОДА ---
+    current_price = await bybit_client.fetch_ticker_price(ccxt_symbol)
+    if current_price == 0:
+        reason = {"reason": "failed_to_fetch_current_price"}
+        log_event("TRADE_REJECTED", reason)
+        raise HTTPException(status_code=503, detail=reason)
+
+    deviation = abs(current_price - signal.entry) / signal.entry
+    if deviation > MAX_ENTRY_DEVIATION_PCT:
+        reason = {
+            "reason": "price_deviation_too_high",
+            "current_price": current_price,
+            "signal_entry": signal.entry,
+            "deviation_pct": deviation * 100
+        }
+        log_event("TRADE_REJECTED", reason)
+        raise HTTPException(status_code=400, detail=reason)
+    # ------------------------------------
+
+    # Шаг 1: Получаем точность для символа
+    try:
+        precision = bybit_client.get_market_precision(ccxt_symbol)
+        if precision is None:
+            raise ValueError(f"Precision info not found for {ccxt_symbol}")
+        amount_precision_step = float(precision['amount'])
+    except Exception as e:
+        log_event("TRADE_REJECTED", {"reason": "precision_error", "details": str(e)})
+        raise HTTPException(status_code=404, detail=f"Market symbol '{ccxt_symbol}' not found or precision not available: {e}")
+
+    # Шаг 2: Расчет размера позиции
+    equity = await bybit_client.get_usdt_balance()
+    qty = calculate_position_size(
+        entry_price=signal.entry,
+        stop_loss_price=signal.sl,
+        equity=equity,
+        amount_precision_step=amount_precision_step
+    )
+    
+    if qty <= 0:
+        reason = {"reason": "risk_sizer_returned_zero_qty", "calculated_qty": qty, "equity": equity}
+        log_event("TRADE_REJECTED", reason)
+        raise HTTPException(status_code=400, detail=reason)
+
+    # Шаг 3: Установка параметров риска
+    await bybit_client.set_margin_mode(ccxt_symbol, 'isolated')
+    await bybit_client.set_leverage(ccxt_symbol, 10)
+
+    # Шаг 4: Исполнение ордера
+    order = await bybit_client.create_market_order_with_sl(
+        symbol=ccxt_symbol, 
+        side='buy' if signal.side == 'long' else 'sell',
+        amount=qty,
+        stop_loss_price=signal.sl
+    )
+
+    if 'error' in order:
+        # Ошибка уже залогирована внутри wrapper'а
+        raise HTTPException(status_code=500, detail={"reason": "order_placement_failed", "details": order})
+
+    # Шаг 5: Успешный ответ
+    # `prob` возвращаем как -1, чтобы обозначить, что фильтр был отключен
+    return {"accepted": True, "qty": qty, "prob": -1, "order": order}
+
+# --- Utility Endpoints ---
+@app.get("/ping")
+async def ping():
+    return {"status": "ok", "timestamp": time.time()}
+
+@app.get("/open_positions", response_model=Dict[str, Any])
+async def get_open_positions():
+    try:
+        return await bybit_client.fetch_open_positions()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={'error': 'bybit-fetch_failed', 'details': str(e)})
+
+🔹 File: risk_controls.py
+----------------------------------------------
+import sqlite3
+import os
+from datetime import date
+from functools import wraps
+from fastapi import HTTPException
+
+DATABASE_FILE = os.getenv("TRADE_DB", "trades.sqlite")
+INITIAL_EQUITY = 1000.0
+
+def get_db_connection():
+    # This now uses the (potentially monkeypatched) module-level constant
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def initialize_pnl_table():
+    """Creates the daily_pnl table if it doesn't exist."""
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS daily_pnl (
+            trade_date DATE PRIMARY KEY,
+            realised_pnl REAL NOT NULL DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# REMOVED: The top-level call to initialize_pnl_table() was removed.
+
+def check_daily_drawdown(max_loss_pct: float = 0.03):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            today = date.today()
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            current_equity = INITIAL_EQUITY
+            max_loss_usd = current_equity * max_loss_pct
+
+            cursor.execute("SELECT realised_pnl FROM daily_pnl WHERE trade_date = ?", (today,))
+            result = cursor.fetchone()
+            conn.close()
+
+            realised_pnl = result['realised_pnl'] if result else 0.0
+
+            if realised_pnl <= -max_loss_usd:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Daily loss limit of ${max_loss_usd:.2f} reached. Realised PnL: ${realised_pnl:.2f}. No new trades allowed."
+                )
+            
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def update_pnl(pnl: float):
+    """Updates the PnL for the current day."""
+    today = date.today()
+    conn = get_db_connection()
+    conn.execute('''
+        INSERT INTO daily_pnl (trade_date, realised_pnl)
+        VALUES (?, ?)
+        ON CONFLICT(trade_date) DO UPDATE SET
+        realised_pnl = realised_pnl + excluded.realised_pnl;
+    ''', (today, pnl))
+    conn.commit()
+    conn.close()
+
+🔹 File: risk_sizer.py
+----------------------------------------------
+# File: risk_sizer.py
+import math
+
+RISK_PER_TRADE_PCT = 0.01
+
+def calculate_position_size(
+    entry_price: float,
+    stop_loss_price: float,
+    equity: float,
+    amount_precision_step: float,
+    risk_pct: float = RISK_PER_TRADE_PCT
+) -> float:
+    
+    price_diff = abs(entry_price - stop_loss_price)
+    if equity <= 0 or price_diff == 0:
+        return 0.0
+        
+    risk_per_trade_usd = equity * risk_pct
+    position_size = risk_per_trade_usd / price_diff
+
+    # ИЗМЕНЕНО: Используем более надежный метод округления
+    if amount_precision_step == 1:
+        # Для целых чисел (как SHIB) используем стандартное округление до целого
+        return round(position_size)
+    else:
+        # Для дробных - вычисляем количество знаков из шага
+        decimal_places = -int(math.log10(amount_precision_step))
+        return round(position_size, decimal_places)
+
+🔹 File: spring_model.py
+----------------------------------------------
+import pandas as pd
+import numpy as np
+
+def bounce_prob(
+    bars: pd.DataFrame,
+    side: str,
+    price: float,
+    bb_window: int = 20,
+    bb_std_dev: float = 2.0
+) -> float:
+    """
+    Calculates the 'bounce probability' based on a Bollinger Band mean-reversion model.
+
+    Args:
+        bars: DataFrame with historical data, must contain a 'close' column.
+        side: The trade side, either 'long' or 'short'.
+        price: The current price to evaluate.
+        bb_window: The moving average window for Bollinger Bands.
+        bb_std_dev: The standard deviation multiplier for Bollinger Bands.
+
+    Returns:
+        A probability score [0, 1] indicating the likelihood of a bounce.
+    """
+    if side not in ['long', 'short']:
+        raise ValueError("Side must be either 'long' or 'short'.")
+
+    if len(bars) < bb_window:
+        # Not enough data to calculate BBs, no basis for a bounce.
+        return 0.0
+
+    # Calculate Bollinger Bands from the historical bars
+    closes = bars['close']
+    mu = closes.rolling(window=bb_window).mean().iloc[-1]
+    sigma = closes.rolling(window=bb_window).std().iloc[-1]
+
+    # Handle case of zero volatility to prevent division by zero
+    if sigma == 0:
+        return 0.0
+
+    lower_bb = mu - bb_std_dev * sigma
+    upper_bb = mu + bb_std_dev * sigma
+    p_raw = 0.0
+
+    if side == "long":
+        # Probability increases as price drops further below the lower band.
+        if price < lower_bb:
+            p_raw = (lower_bb - price) / (bb_std_dev * sigma)
+    else:  # side == "short"
+        # Probability increases as price rises further above the upper band.
+        if price > upper_bb:
+            p_raw = (price - upper_bb) / (bb_std_dev * sigma)
+    
+    # Clip the result to be within the valid probability range [0, 1]
+    return float(np.clip(p_raw, 0, 1))
+
+🔹 File: tests/__init__.py
+----------------------------------------------
+# This file is intentionally left empty.
+# It marks the 'tests' directory as a Python package.
+
+🔹 File: tests/conftest.py
+----------------------------------------------
+# File: tests/conftest.py
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+
+@pytest.fixture
+def mock_bybit_client_main(monkeypatch):
+    mock_client = AsyncMock()
+    mock_client.get_usdt_balance.return_value = 1000.0
+    mock_client.create_market_order_with_sl.return_value = {"id": "12345"}
+    
+    # ИЗМЕНЕНО: get_market_precision теперь синхронный мок
+    mock_client.get_market_precision = MagicMock(
+        return_value={"amount": 0.001, "price": 0.01}
+    )
+    
+    mock_client.fetch_open_positions.return_value = {
+        'BTCUSDT': {'symbol': 'BTCUSDT', 'contracts': 1.0}
+    }
+    
+    monkeypatch.setattr('main.bybit_client', mock_client)
+    
+    return mock_client
+
+🔹 File: tests/test_api_execute.py
+----------------------------------------------
+import pytest
+from fastapi.testclient import TestClient
+import os
+
+# Импортируем app, моки будут применены через conftest
+from main import app
+client = TestClient(app)
+
+# Эта фикстура теперь только мокирует логирование
+@pytest.fixture(autouse=True)
+def setup_common_mocks(mocker):
+    """Общие моки для всех тестов в этом файле."""
+    mocker.patch('main.log_signal')
+    mocker.patch('main.log_event')
+    yield
+
+def test_execute_trade_calls_all_methods_correctly(mock_bybit_client_main):
+    """
+    Тестирует, что эндпоинт /execute корректно вызывает всю цепочку методов:
+    1. get_market_precision
+    2. get_usdt_balance
+    3. set_margin_mode
+    4. set_leverage
+    5. create_market_order_with_sl
+    """
+    signal = {"symbol": "BTCUSDT", "side": "long", "entry": 53000, "sl": 52500, "tp": 54000}
+    
+    # Сбрасываем счетчики вызовов мока перед тестом
+    mock_bybit_client_main.reset_mock()
+    
+    response = client.post("/execute", json=signal)
+    
+    # 1. Проверяем, что ответ успешный
+    assert response.status_code == 200, response.json()
+    data = response.json()
+    assert data["accepted"] is True
+    assert data["order"]["id"] == "12345"
+
+    # 2. Проверяем, что все нужные методы wrapper'а были вызваны, и именно в этом порядке
+    call_order = [call[0] for call in mock_bybit_client_main.method_calls]
+    expected_order = [
+        'get_market_precision',
+        'get_usdt_balance',
+        'set_margin_mode',
+        'set_leverage',
+        'create_market_order_with_sl'
+    ]
+    assert call_order == expected_order
+
+    # 3. Проверяем аргументы ключевых вызовов
+    mock_bybit_client_main.get_market_precision.assert_called_once_with("BTC/USDT:USDT")
+    mock_bybit_client_main.set_margin_mode.assert_called_once_with("BTC/USDT:USDT", "isolated")
+    mock_bybit_client_main.set_leverage.assert_called_once_with("BTC/USDT:USDT", 10)
+    mock_bybit_client_main.create_market_order_with_sl.assert_called_once()
+
+🔹 File: tests/test_api_utils.py
+----------------------------------------------
+# File: tests/test_api_utils.py
+import pytest
+from fastapi.testclient import TestClient
+from main import app
+
+client = TestClient(app)
+
+def test_ping():
+    response = client.get("/ping")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+def test_open_positions_returns_dict(mock_bybit_client_main): # Используем фикстуру
+    response = client.get('/open_positions')
+    assert response.status_code == 200
+    data = response.json()
+    assert "BTCUSDT" in data
+    assert data['BTCUSDT']['contracts'] == 1.0
+
+🔹 File: tests/test_backtest_runner.py
+----------------------------------------------
+import pytest
+import pandas as pd
+import numpy as np
+from backtest_runner import run_backtest, calculate_metrics
+
+def test_backtest_run(monkeypatch): # <-- ADDED monkeypatch
+    # Create synthetic data with some volatility to prevent sigma=0
+    prices = pd.DataFrame({
+        'ts': range(100, 200),
+        'close': list(np.linspace(101, 100, 50)) + list(np.linspace(91, 90, 50)),
+        'low': list(np.linspace(100, 99, 50)) + list(np.linspace(86, 85, 50)),
+        'high': list(np.linspace(102, 101, 50)) + list(np.linspace(96, 95, 50))
+    })
+    signals = pd.DataFrame({
+        'ts': [150],
+        'side': ['long'],
+        'entry': [90],
+        'sl': [88]
+    })
+    
+    # Use monkeypatch to correctly override the function in the target module
+    monkeypatch.setattr("backtest_runner.bounce_prob", lambda *args, **kwargs: 1.0)
+    
+    equity_curve, trades = run_backtest(prices, signals, bb_window=20, bb_std_dev=2.0)
+    
+    assert len(trades) > 0
+    assert equity_curve[-1] != 1000.0
+
+def test_metrics_calculation():
+    equity_curve = [1000, 1010, 1005, 1020, 1015]
+    total_r, max_dd, sharpe = calculate_metrics(equity_curve, num_days=1)
+    
+    assert total_r == pytest.approx(0.015)
+    # The calculated value is -0.004950495...
+    assert max_dd == pytest.approx(-0.00495, abs=1e-5)
+    assert sharpe is not None
+
+🔹 File: tests/test_bybit_wrapper.py
+----------------------------------------------
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+import ccxt.async_support as ccxt
+from bybit_wrapper import AsyncBybitWrapper
+
+@pytest.fixture
+def mock_exchange():
+    """Фикстура, создающая мок-объект для ccxt.exchange."""
+    exchange = AsyncMock()
+    exchange.load_markets.return_value = None
+    exchange.set_sandbox_mode.return_value = None
+    exchange.fetch_balance.return_value = {
+        'USDT': {'free': 1000.0, 'used': 0.0, 'total': 1000.0}
+    }
+    exchange.create_order.return_value = {'id': '12345', 'status': 'open'}
+    exchange.market.return_value = {
+        'precision': {'amount': 3, 'price': 2}
+    }
+    return exchange
+
+
+@pytest.mark.asyncio
+async def test_init_and_get_balance(mock_exchange, mocker):
+    """Тестирует успешную инициализацию и получение баланса."""
+    # Подменяем реальный ccxt.bybit на наш мок
+    mocker.patch('ccxt.async_support.bybit', return_value=mock_exchange)
+    
+    # Создаем экземпляр с фиктивными ключами
+    wrapper = AsyncBybitWrapper(api_key="dummy", secret_key="dummy", testnet=True)
+    await wrapper.init()
+    balance = await wrapper.get_usdt_balance()
+    await wrapper.close()
+
+    assert balance == 1000.0
+    mock_exchange.load_markets.assert_called_once()
+    mock_exchange.fetch_balance.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_order_success(mock_exchange, mocker):
+    """Тестирует успешное создание ордера."""
+    mocker.patch('ccxt.async_support.bybit', return_value=mock_exchange)
+    mock_log = mocker.patch('bybit_wrapper.log_trade_execution')
+    
+    wrapper = AsyncBybitWrapper(api_key="dummy", secret_key="dummy", testnet=True)
+    await wrapper.init()
+    result = await wrapper.create_market_order_with_sl('BTC/USDT:USDT', 'buy', 0.01, 59000.0)
+    await wrapper.close()
+
+    assert result['id'] == '12345'
+    mock_log.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_order_insufficient_funds(mock_exchange, mocker):
+    """Тестирует обработку ошибки нехватки средств."""
+    error_message = "bybit-insufficient-balance-for-order-cost"
+    mock_exchange.create_order.side_effect = ccxt.InsufficientFunds(error_message)
+    mocker.patch('ccxt.async_support.bybit', return_value=mock_exchange)
+    mock_log = mocker.patch('bybit_wrapper.log_trade_execution')
+
+    wrapper = AsyncBybitWrapper(api_key="dummy", secret_key="dummy", testnet=True)
+    await wrapper.init()
+    result = await wrapper.create_market_order_with_sl('BTC/USDT:USDT', 'buy', 1.0, 59000.0)
+    await wrapper.close()
+
+    assert 'error' in result
+    assert error_message in result['error']
+    mock_log.assert_called_once()
+
+🔹 File: tests/test_risk_controls.py
+----------------------------------------------
+import pytest
+import sqlite3
+import os
+import numpy as np
+from datetime import date
+from fastapi import HTTPException
+
+# Import the module itself to allow monkeypatching
+import risk_controls
+# Import the functions we need to call
+from risk_controls import check_daily_drawdown, update_pnl, get_db_connection
+
+TEST_DB = "test_trades_isolated.sqlite"
+
+@pytest.fixture(autouse=True)
+def setup_teardown_db(monkeypatch):
+    """
+    This fixture is now robust and guarantees test isolation.
+    """
+    # 1. Use monkeypatch to temporarily change the DATABASE_FILE constant
+    #    within the risk_controls module for the duration of one test.
+    monkeypatch.setattr(risk_controls, "DATABASE_FILE", TEST_DB)
+
+    # 2. Clean up any previous test database file before the test starts.
+    if os.path.exists(TEST_DB):
+        os.remove(TEST_DB)
+    
+    # 3. Initialize a fresh table for this specific test.
+    risk_controls.initialize_pnl_table()
+    
+    yield  # Run the test
+
+    # 4. Clean up the database file after the test is done.
+    if os.path.exists(TEST_DB):
+        os.remove(TEST_DB)
+
+
+# A dummy async function to be decorated
+@check_daily_drawdown(max_loss_pct=0.03)
+async def dummy_trade_route():
+    return {"status": "trade allowed"}
+
+@pytest.mark.asyncio
+async def test_dd_within_limit():
+    update_pnl(-10.0) # Loss is < 3% of 1000
+    response = await dummy_trade_route()
+    assert response == {"status": "trade allowed"}
+
+@pytest.mark.asyncio
+async def test_dd_at_limit():
+    update_pnl(-30.0)
+    with pytest.raises(HTTPException) as excinfo:
+        await dummy_trade_route()
+    assert excinfo.value.status_code == 429
+
+@pytest.mark.asyncio
+async def test_dd_exceeds_limit():
+    update_pnl(-35.0)
+    with pytest.raises(HTTPException) as excinfo:
+        await dummy_trade_route()
+    assert excinfo.value.status_code == 429
+    # This assertion will now pass because the PnL is isolated.
+    assert "-35.00" in excinfo.value.detail
+
+@pytest.mark.asyncio
+async def test_no_pnl_for_today():
+    # PnL starts at 0 for this test, so it is allowed.
+    response = await dummy_trade_route()
+    assert response == {"status": "trade allowed"}
+
+def test_update_pnl_idempotency():
+    update_pnl(10.5)
+    update_pnl(-5.5)
+    
+    conn = get_db_connection()
+    pnl = conn.execute("SELECT realised_pnl FROM daily_pnl WHERE trade_date = ?", (date.today(),)).fetchone()['realised_pnl']
+    conn.close()
+    # This will now correctly be 5.0, not an accumulated value.
+    assert np.isclose(pnl, 5.0)
+
+🔹 File: tests/test_risk_sizer.py
+----------------------------------------------
+# File: tests/test_risk_sizer.py
+import pytest
+from risk_sizer import calculate_position_size
+
+def test_calculate_position_size_btc():
+    # step для BTC = 0.001
+    size = calculate_position_size(60000.0, 59000.0, 1000.0, amount_precision_step=0.001)
+    assert size == 0.01
+
+def test_calculate_position_size_altcoin():
+    # step для SOL = 0.01
+    size = calculate_position_size(150.0, 145.0, 1000.0, amount_precision_step=0.01)
+    assert size == 2.0
+
+def test_calculate_position_size_shibcoin():
+    # step для SHIB = 1 (целое число)
+    size = calculate_position_size(0.000025, 0.000024, 1000.0, amount_precision_step=1)
+    # ИЗМЕНЕНО: round(10000000.0) == 10000000
+    assert size == 10000000
+
+def test_calculate_position_size_zero_balance():
+    size = calculate_position_size(60000.0, 59000.0, 0.0, amount_precision_step=0.001)
+    assert size == 0.0
+
+def test_calculate_position_size_zero_price_diff():
+    size = calculate_position_size(60000.0, 60000.0, 1000.0, amount_precision_step=0.001)
+    assert size == 0.0
+
+
+🔹 File: tests/test_spring_model.py
+----------------------------------------------
+import pytest
+import pandas as pd
+import numpy as np
+from spring_model import bounce_prob
+
+@pytest.fixture
+def synthetic_bars():
+    # Synthetic data where mu=100, sigma=5
+    # Lower BB = 100 - 2*5 = 90
+    # Upper BB = 100 + 2*5 = 110
+    np.random.seed(42)
+    data = np.concatenate([np.random.normal(100, 5, 19), [100]])
+    return pd.DataFrame({'close': data})
+
+def test_long_bounce_strong(synthetic_bars):
+    # Price is far below the lower BB, expecting high probability
+    prob = bounce_prob(synthetic_bars, 'long', price=80, bb_std_dev=2.0)
+    assert prob > 0.5
+    assert prob <= 1.0
+
+def test_long_bounce_zero(synthetic_bars):
+    # Price is inside the bands, expecting zero probability
+    prob = bounce_prob(synthetic_bars, 'long', price=95, bb_std_dev=2.0)
+    assert prob == 0.0
+
+def test_short_bounce_strong(synthetic_bars):
+    # Price is far above the upper BB, expecting high probability
+    prob = bounce_prob(synthetic_bars, 'short', price=120, bb_std_dev=2.0)
+    assert prob > 0.5
+    assert prob <= 1.0
+
+def test_short_bounce_zero(synthetic_bars):
+    # Price is inside the bands, expecting zero probability
+    prob = bounce_prob(synthetic_bars, 'short', price=105, bb_std_dev=2.0)
+    assert prob == 0.0
+
+def test_edge_case_not_enough_data():
+    bars = pd.DataFrame({'close': [100, 101]})
+    prob = bounce_prob(bars, 'long', price=95, bb_window=20)
+    assert prob == 0.0
+
+def test_edge_case_zero_volatility():
+    bars = pd.DataFrame({'close': [100] * 20})
+    prob = bounce_prob(bars, 'long', price=95, bb_window=20)
+    assert prob == 0.0
+
+def test_invalid_side(synthetic_bars):
+    with pytest.raises(ValueError):
+        bounce_prob(synthetic_bars, 'sideways', price=100)
+
+🔹 File: tests/test_trade_logger.py
+----------------------------------------------
+# File: tests/test_trade_logger.py (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+import pytest
+import os
+from datetime import datetime
+import trade_logger
+
+TEST_DB = "test_log_final.sqlite"
+
+@pytest.fixture(autouse=True)
+def setup_teardown_db(monkeypatch):
+    monkeypatch.setattr(trade_logger, "DATABASE_FILE", TEST_DB)
+    monkeypatch.setattr(trade_logger, "_db_instance", None)
+    
+    if os.path.exists(TEST_DB):
+        os.remove(TEST_DB)
+    yield
+    if os.path.exists(TEST_DB):
+        os.remove(TEST_DB)
+
+def test_log_signal():
+    signal_data = {
+        'pair': 'BTC/USDT:USDT',
+        'side': 'long',
+    }
+    trade_logger.log_signal(signal_data)
+    db = trade_logger.get_db()
+    log_entry = list(db["trade_log"].rows)[0]
+    assert log_entry["event_type"] == "SIGNAL_RECEIVED"
+    assert log_entry["pair"] == "BTC/USDT:USDT"
+
+def test_log_successful_execution():
+    order_data = {
+        'id': '123456789', 'cid': 'my_client_id_001', 'symbol': 'BTC/USDT:USDT',
+        'side': 'buy', 'amount': 0.001, 'price': 60100.0,
+        'status': 'open', 'error': None
+    }
+    trade_logger.log_trade_execution(order_data)
+
+    db = trade_logger.get_db()
+    log_entry = list(db["trade_log"].rows)[0]
+
+    assert log_entry["event_type"] == "ORDER_PLACED"
+    # ИЗМЕНЕНО: Проверяем ключ 'id', который приходит от CCXT и записывается в лог
+    assert log_entry["id"] == '123456789' 
+    assert log_entry["error"] is None
+
+🔹 File: trade_logger.py
+----------------------------------------------
+import sqlite_utils
+import os
+from datetime import datetime, timezone
+
+DATABASE_FILE = os.getenv("TRADE_DB", "trades.sqlite")
+
+# Глобальный объект для хранения единственного экземпляра подключения
+_db_instance = None
+
+def get_db():
+    """
+    Возвращает единственный экземпляр подключения к базе данных (синглтон).
+    Это повышает производительность и безопасность в многопоточной среде.
+    """
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = sqlite_utils.Database(DATABASE_FILE)
+    return _db_instance
+
+def log_event(event_type: str, payload: dict):
+    """
+    Записывает событие в таблицу 'trade_log'.
+    """
+    db = get_db()
+    # pk="id" убран. sqlite-utils будет использовать стандартный rowid.
+    log_table = db.table("trade_log")
+    
+    record = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+    }
+    record.update(payload)
+    
+    log_table.insert(record, alter=True)
+    print(f"[LOG] Event '{event_type}': {payload}")
+
+def log_signal(signal: dict):
+    """Логирует входящий торговый сигнал."""
+    log_event("SIGNAL_RECEIVED", payload=signal)
+
+def log_trade_execution(order_result: dict):
+    """Логирует результат размещения ордера на бирже."""
+    payload = {
+        "client_order_id": order_result.get('cid'),
+        "exchange_order_id": order_result.get('id'),
+        "symbol": order_result.get('symbol'),
+        "side": order_result.get('side'),
+        "amount": order_result.get('amount'),
+        "price": order_result.get('price'),
+        "status": order_result.get('status'),
+        "error": order_result.get('error')
+    }
+    event_type = "ORDER_FAILED" if payload['error'] else "ORDER_PLACED"
+    log_event(event_type, payload=payload)
+
+def log_trade_execution(order_result: dict):
+    """Логирует результат размещения ордера на бирже."""
+    # Создаем копию, чтобы не изменять оригинальный объект от ccxt
+    payload = order_result.copy()
+    event_type = "ORDER_FAILED" if payload.get('error') else "ORDER_PLACED"
+    log_event(event_type, payload=payload)
+
+def log_signal(signal: dict):
+    """Логирует входящий торговый сигнал."""
+    log_event("SIGNAL_RECEIVED", payload=signal)

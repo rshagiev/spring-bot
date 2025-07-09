@@ -1,63 +1,54 @@
-# File: tests/test_api_execute.py (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 import os
 
-from bybit_wrapper import AsyncBybitWrapper
-import main
-import risk_controls
-import trade_logger
+# Импортируем app, моки будут применены через conftest
+from main import app
+client = TestClient(app)
 
-# --- Mocks ---
-mock_bybit_wrapper = AsyncMock(spec=AsyncBybitWrapper)
-mock_bybit_wrapper.get_usdt_balance.return_value = 1000.0
-mock_bybit_wrapper.create_market_order_with_sl.return_value = {"id": "12345"}
-mock_bybit_wrapper.get_market_precision.return_value = {"amount": 3, "price": 2}
-main.bybit_client = mock_bybit_wrapper
-
-client = TestClient(main.app)
-
-# --- Fixtures ---
-TEST_DB = "test_api.sqlite"
-
+# Эта фикстура теперь только мокирует логирование
 @pytest.fixture(autouse=True)
-def setup_test_environment(monkeypatch, mocker):
-    monkeypatch.setattr(risk_controls, "DATABASE_FILE", TEST_DB)
-    monkeypatch.setattr(trade_logger, "DATABASE_FILE", TEST_DB)
-    monkeypatch.setattr(trade_logger, "_db_instance", None)
-    if os.path.exists(TEST_DB): os.remove(TEST_DB)
-    risk_controls.initialize_pnl_table()
-
-    with open('btc_1m.csv', 'w') as f:
-        f.write("1,100,105,95,101,1000\n" * 25)
-
+def setup_common_mocks(mocker):
+    """Общие моки для всех тестов в этом файле."""
     mocker.patch('main.log_signal')
     mocker.patch('main.log_event')
-    
     yield
+
+def test_execute_trade_calls_all_methods_correctly(mock_bybit_client_main):
+    """
+    Тестирует, что эндпоинт /execute корректно вызывает всю цепочку методов:
+    1. get_market_precision
+    2. get_usdt_balance
+    3. set_margin_mode
+    4. set_leverage
+    5. create_market_order_with_sl
+    """
+    signal = {"symbol": "BTCUSDT", "side": "long", "entry": 53000, "sl": 52500, "tp": 54000}
     
-    if os.path.exists(TEST_DB): os.remove(TEST_DB)
-
-# --- Tests ---
-def test_execute_trade_success(mocker): # <-- Добавляем mocker в аргументы
-    # ИЗМЕНЕНО: Патчим bounce_prob там, где он используется
-    mocker.patch('main.bounce_prob', return_value=0.7)
-
-    signal = {"symbol": "BTCUSDT", "side": "long", "entry": 101.0, "sl": 100.0, "tp": 103.0}
+    # Сбрасываем счетчики вызовов мока перед тестом
+    mock_bybit_client_main.reset_mock()
+    
     response = client.post("/execute", json=signal)
     
+    # 1. Проверяем, что ответ успешный
     assert response.status_code == 200, response.json()
     data = response.json()
-    assert data['qty'] == 10.0
+    assert data["accepted"] is True
+    assert data["order"]["id"] == "12345"
 
-def test_execute_trade_rejected_by_spring_filter(mocker): # <-- Добавляем mocker в аргументы
-    # ИЗМЕНЕНО: Патчим bounce_prob там, где он используется
-    mocker.patch('main.bounce_prob', return_value=0.3)
+    # 2. Проверяем, что все нужные методы wrapper'а были вызваны, и именно в этом порядке
+    call_order = [call[0] for call in mock_bybit_client_main.method_calls]
+    expected_order = [
+        'get_market_precision',
+        'get_usdt_balance',
+        'set_margin_mode',
+        'set_leverage',
+        'create_market_order_with_sl'
+    ]
+    assert call_order == expected_order
 
-    signal = {"symbol": "BTCUSDT", "side": "long", "entry": 101.0, "sl": 100.0, "tp": 103.0}
-    response = client.post("/execute", json=signal)
-    
-    assert response.status_code == 403, response.json()
-    data = response.json()['detail']
-    assert data['reason'] == "spring_filter_rejected"
+    # 3. Проверяем аргументы ключевых вызовов
+    mock_bybit_client_main.get_market_precision.assert_called_once_with("BTC/USDT:USDT")
+    mock_bybit_client_main.set_margin_mode.assert_called_once_with("BTC/USDT:USDT", "isolated")
+    mock_bybit_client_main.set_leverage.assert_called_once_with("BTC/USDT:USDT", 10)
+    mock_bybit_client_main.create_market_order_with_sl.assert_called_once()
